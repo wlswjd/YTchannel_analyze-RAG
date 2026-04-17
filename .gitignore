@@ -1,0 +1,38 @@
+# ---- Secrets ----
+.env
+*.env
+cookies.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ---- OS / Editor ----
+.DS_Store
+.vscode/
+.idea/
+
+# ---- Project outputs / large artifacts ----
+*.jsonl
+*.log
+
+# Dataset / raw exports (keep out of git; use a separate storage)
+ddeunddeun_raw_data.json
+ddeunddeun_raw_data_with_transcripts.json
+
+# Temporary subtitle downloads / caches
+.tmp_subs/
+.yt-dlp-cache/
+
