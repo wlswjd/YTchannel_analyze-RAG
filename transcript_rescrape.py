@@ -147,6 +147,12 @@ def main():
         help="입력/출력 JSON 경로 (기본: ddeunddeun_raw_data.json)",
     )
     parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="출력 JSON 경로 (기본: --input과 동일한 파일에 덮어쓰기)",
+    )
+    parser.add_argument(
         "--batch",
         type=int,
         default=None,
@@ -160,10 +166,16 @@ def main():
         default=41,
         help="한 번에 처리할 재수집 대상 개수 (기본: 41)",
     )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=1,
+        help="N개 처리마다 중간 저장 (기본: 1, 즉 매 영상마다 저장)",
+    )
     args = parser.parse_args()
 
     input_path = args.input.resolve()
-    output_path = input_path
+    output_path = args.output.resolve() if args.output else input_path
 
     data = json.loads(input_path.read_text(encoding="utf-8"))
 
@@ -183,6 +195,8 @@ def main():
     all_retry_targets = [v for v in data if needs_retry(v.get("transcript", ""))]
     total_retry = len(all_retry_targets)
     print(f"총 {len(data)}개 중 재수집 대상 {total_retry}개")
+    print(f"입력: {input_path}")
+    print(f"출력: {output_path}")
 
     if args.batch is not None:
         if args.batch < 1:
@@ -234,8 +248,8 @@ def main():
         # Gentle pacing to reduce blocking
         time.sleep(random.uniform(4.0, 7.0))
 
-        # checkpoint every 10
-        if idx % 10 == 0:
+        # checkpoint
+        if args.save_every > 0 and idx % args.save_every == 0:
             output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -245,4 +259,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
