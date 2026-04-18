@@ -4,15 +4,15 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-
-WORKDIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import ROOT, resolve_raw_json  # noqa: E402
 
 
 def _vtt_to_text(vtt: str) -> str:
-    # Remove WEBVTT headers, timestamps, and cue settings. Keep human-readable lines.
     lines = []
     for raw in vtt.splitlines():
         line = raw.strip()
@@ -25,13 +25,10 @@ def _vtt_to_text(vtt: str) -> str:
         if "-->" in line:
             continue
         if re.fullmatch(r"\d+", line):
-            # cue number
             continue
-        # common vtt tags
         line = re.sub(r"<[^>]+>", "", line)
         if line:
             lines.append(line)
-    # De-dup consecutive identical lines (VTT often repeats)
     out = []
     prev = None
     for l in lines:
@@ -43,16 +40,11 @@ def _vtt_to_text(vtt: str) -> str:
 
 
 def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
-    """
-    Returns transcript text if subtitles found, otherwise None.
-    Uses yt-dlp to write VTT files into workspace temp folder.
-    """
-    tmp_dir = WORKDIR / ".tmp_subs"
+    tmp_dir = ROOT / ".tmp_subs"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = WORKDIR / ".yt-dlp-cache"
+    cache_dir = ROOT / ".yt-dlp-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Avoid reading stale VTT from a previous run for the same video_id.
     for old in tmp_dir.glob(f"{video_id}*.vtt"):
         try:
             old.unlink()
@@ -84,18 +76,14 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
         url,
     ]
 
-    # Optional: authenticated cookies can greatly reduce throttling.
-    # - If you place a cookies.txt in the project root, it will be used.
-    # - Or set YTDLP_COOKIES_FROM_BROWSER (e.g. "chrome", "brave", "safari") to use browser cookies.
     cookies_from_browser = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
     if cookies_from_browser:
         cmd.extend(["--cookies-from-browser", cookies_from_browser])
     else:
-        cookies_txt = WORKDIR / "cookies.txt"
+        cookies_txt = ROOT / "cookies.txt"
         if cookies_txt.exists():
             cmd.extend(["--cookies", str(cookies_txt)])
 
-    # Avoid local proxy envs interfering; also helps reproducibility.
     env = os.environ.copy()
     for k in list(env.keys()):
         if "proxy" in k.lower():
@@ -110,8 +98,6 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
             print(f"    yt-dlp 실패 ({video_id}, langs={langs}):\n    {last}")
         return None
 
-    # yt-dlp may create one of:
-    #   <id>.ko.vtt, <id>.ko-KR.vtt, <id>.en.vtt, <id>.en.auto.vtt, etc.
     candidates = sorted(tmp_dir.glob(f"{video_id}.*.vtt"), key=lambda p: p.name)
     if not candidates:
         print(
@@ -120,7 +106,6 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
         )
         return None
 
-    # Prefer KO, then EN, then anything.
     def rank(p: Path) -> tuple[int, int]:
         name = p.name.lower()
         if ".ko." in name or ".ko-kr." in name:
@@ -137,49 +122,44 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="재수집 대상만 yt-dlp로 자막을 채우고 JSON에 반영합니다. "
-        "ddeunddeun_raw_data.json을 읽고 같은 파일에 덮어씁니다."
+        description="재수집 대상만 yt-dlp로 자막을 채우고 JSON에 반영합니다."
     )
     parser.add_argument(
         "--input",
         type=Path,
-        default=WORKDIR / "ddeunddeun_raw_data.json",
-        help="입력/출력 JSON 경로 (기본: ddeunddeun_raw_data.json)",
+        default=None,
+        help="입력/출력 JSON (기본: data/raw/ddeunddeun_raw_data.json 등 resolve)",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="출력 JSON 경로 (기본: --input과 동일한 파일에 덮어쓰기)",
+        help="출력 JSON 경로 (기본: --input과 동일)",
     )
     parser.add_argument(
         "--batch",
         type=int,
         default=None,
         metavar="N",
-        help="재수집 대상 목록을 batch-size개씩 나눌 때 몇 번째 묶음인지 (1부터). "
-        "예: 205개, batch-size 41이면 1~5.",
+        help="재수집 대상을 batch-size개씩 나눌 때 몇 번째 묶음인지 (1부터).",
     )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=41,
-        help="한 번에 처리할 재수집 대상 개수 (기본: 41)",
-    )
+    parser.add_argument("--batch-size", type=int, default=41)
     parser.add_argument(
         "--save-every",
         type=int,
         default=1,
-        help="N개 처리마다 중간 저장 (기본: 1, 즉 매 영상마다 저장)",
+        help="N개 처리마다 중간 저장",
     )
     args = parser.parse_args()
 
-    input_path = args.input.resolve()
+    input_path = args.input
+    if input_path is None:
+        input_path = resolve_raw_json("ddeunddeun_raw_data.json")
+    input_path = input_path.resolve()
     output_path = args.output.resolve() if args.output else input_path
 
     data = json.loads(input_path.read_text(encoding="utf-8"))
 
-    # Only retry ones that previously errored or were placeholders.
     def needs_retry(t: str) -> bool:
         if not t:
             return True
@@ -187,7 +167,6 @@ def main():
             return True
         if "자막이 제공되지 않는 영상" in t:
             return True
-        # 새 플레이스홀더 (yt-dlp 실패 시)
         if "자막이 제공되지 않거나 수집할 수 없는 영상" in t:
             return True
         return False
@@ -215,9 +194,7 @@ def main():
         targets = all_retry_targets
         print(f"전체 재수집 대상 {len(targets)}개를 한 번에 처리합니다.")
 
-    # Manual `yt-dlp --sub-langs ko`가 잘 되는 경우가 많아, 먼저 단일 언어(ko, en)만 시도.
-    # `ko.*`는 트랙이 많아질 수 있어 429에 더 잘 걸립니다.
-    lang_attempts = ["ko", "en", "ko.*", "en.*"]
+    lang_attempts = ["ko", "en"]
 
     ok = 0
     none = 0
@@ -227,7 +204,6 @@ def main():
 
         text = None
         for attempt_langs in lang_attempts:
-            # retry with exponential backoff on throttling/temporary errors
             for retry in range(4):
                 text = _run_yt_dlp_fetch_vtt(vid, langs=attempt_langs)
                 if text:
@@ -245,10 +221,8 @@ def main():
             none += 1
             print(f"[{idx}/{len(targets)}] NONE: {title} ({vid})")
 
-        # Gentle pacing to reduce blocking
         time.sleep(random.uniform(4.0, 7.0))
 
-        # checkpoint
         if args.save_every > 0 and idx % args.save_every == 0:
             output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -2,3 +2,5 @@ google-api-python-client
 python-dotenv
 isodate
 youtube-transcript-api
+streamlit
+pandas

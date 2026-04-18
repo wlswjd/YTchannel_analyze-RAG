@@ -29,8 +29,10 @@ env/
 *.log
 
 # Dataset / raw exports (keep out of git; use a separate storage)
-ddeunddeun_raw_data.json
+*_raw_data.json
 ddeunddeun_raw_data_with_transcripts.json
+data/processed/
+chroma_db/
 
 # Temporary subtitle downloads / caches
 .tmp_subs/
