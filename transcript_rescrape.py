@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import random
@@ -51,6 +52,13 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
     cache_dir = WORKDIR / ".yt-dlp-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # Avoid reading stale VTT from a previous run for the same video_id.
+    for old in tmp_dir.glob(f"{video_id}*.vtt"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
     url = f"https://www.youtube.com/watch?v={video_id}"
     outtmpl = str(tmp_dir / f"{video_id}.%(ext)s")
 
@@ -96,13 +104,20 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
 
     if proc.returncode != 0:
-        # Common case: HTTP 429 throttling. Signal to caller via None.
+        err = (proc.stderr or proc.stdout or "").strip()
+        if err:
+            last = "\n".join(err.splitlines()[-5:])
+            print(f"    yt-dlp 실패 ({video_id}, langs={langs}):\n    {last}")
         return None
 
     # yt-dlp may create one of:
     #   <id>.ko.vtt, <id>.ko-KR.vtt, <id>.en.vtt, <id>.en.auto.vtt, etc.
     candidates = sorted(tmp_dir.glob(f"{video_id}.*.vtt"), key=lambda p: p.name)
     if not candidates:
+        print(
+            f"    yt-dlp는 성공했는데 VTT를 못 찾음 ({video_id}, langs={langs}). "
+            f"tmp={tmp_dir}"
+        )
         return None
 
     # Prefer KO, then EN, then anything.
@@ -121,8 +136,34 @@ def _run_yt_dlp_fetch_vtt(video_id: str, langs: str) -> str | None:
 
 
 def main():
-    input_path = WORKDIR / "ddeunddeun_raw_data.json"
-    output_path = WORKDIR / "ddeunddeun_raw_data_with_transcripts.json"
+    parser = argparse.ArgumentParser(
+        description="재수집 대상만 yt-dlp로 자막을 채우고 JSON에 반영합니다. "
+        "ddeunddeun_raw_data.json을 읽고 같은 파일에 덮어씁니다."
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=WORKDIR / "ddeunddeun_raw_data.json",
+        help="입력/출력 JSON 경로 (기본: ddeunddeun_raw_data.json)",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=None,
+        metavar="N",
+        help="재수집 대상 목록을 batch-size개씩 나눌 때 몇 번째 묶음인지 (1부터). "
+        "예: 205개, batch-size 41이면 1~5.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=41,
+        help="한 번에 처리할 재수집 대상 개수 (기본: 41)",
+    )
+    args = parser.parse_args()
+
+    input_path = args.input.resolve()
+    output_path = input_path
 
     data = json.loads(input_path.read_text(encoding="utf-8"))
 
@@ -134,13 +175,35 @@ def main():
             return True
         if "자막이 제공되지 않는 영상" in t:
             return True
+        # 새 플레이스홀더 (yt-dlp 실패 시)
+        if "자막이 제공되지 않거나 수집할 수 없는 영상" in t:
+            return True
         return False
 
-    targets = [v for v in data if needs_retry(v.get("transcript", ""))]
-    print(f"총 {len(data)}개 중 재수집 대상 {len(targets)}개")
+    all_retry_targets = [v for v in data if needs_retry(v.get("transcript", ""))]
+    total_retry = len(all_retry_targets)
+    print(f"총 {len(data)}개 중 재수집 대상 {total_retry}개")
 
-    # We'll try Korean first, then English as fallback.
-    lang_attempts = ["ko.*", "en.*"]
+    if args.batch is not None:
+        if args.batch < 1:
+            raise SystemExit("--batch는 1 이상이어야 합니다.")
+        start = (args.batch - 1) * args.batch_size
+        end = min(start + args.batch_size, total_retry)
+        if start >= total_retry:
+            print(f"배치 {args.batch}: 범위 밖입니다 (재수집 대상 {total_retry}개, 시작 인덱스 {start}).")
+            return
+        targets = all_retry_targets[start:end]
+        print(
+            f"배치 {args.batch}: 재수집 대상 중 인덱스 {start + 1}~{end} "
+            f"({len(targets)}개 처리)"
+        )
+    else:
+        targets = all_retry_targets
+        print(f"전체 재수집 대상 {len(targets)}개를 한 번에 처리합니다.")
+
+    # Manual `yt-dlp --sub-langs ko`가 잘 되는 경우가 많아, 먼저 단일 언어(ko, en)만 시도.
+    # `ko.*`는 트랙이 많아질 수 있어 429에 더 잘 걸립니다.
+    lang_attempts = ["ko", "en", "ko.*", "en.*"]
 
     ok = 0
     none = 0
@@ -177,7 +240,7 @@ def main():
 
     output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n완료: OK {ok}, NONE {none}")
-    print(f"저장: {output_path.name}")
+    print(f"저장: {output_path}")
 
 
 if __name__ == "__main__":
