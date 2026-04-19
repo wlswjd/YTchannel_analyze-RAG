@@ -21,7 +21,8 @@
 | `scripts/data_collector.py` | 채널 업로드 목록 + 영상 메타 + (선택) `youtube_transcript_api` 자막 → `data/raw/*_raw_data.json` |
 | `scripts/transcript_rescrape.py` | 실패/빈 자막만 **yt-dlp**로 재수집, 같은 JSON에 덮어쓰기 |
 | `scripts/chunk_data.py` | Raw JSON → `data/processed/<이름>_chunks.jsonl` (RAG용 텍스트 청크) |
-| `scripts/streamlit_app.py` | 키워드 검색(청크) + 월별 업로드/조회수 차트 |
+| `scripts/app.py` | 챗봇 UI: 채널 토글·설정(사이드바) + 대사 키워드 검색 + 월별 통계(접기) |
+| `scripts/streamlit_app.py` | `app.py`로 연결 (호환용 진입점) |
 | `scripts/test_api.py` | `@핸들` → 채널 id 확인용 스니펫 |
 
 ## 파이프라인 방향
@@ -46,11 +47,12 @@
 3. **앱에서 검색·분석**
 
 ```bash
-.venv/bin/streamlit run scripts/streamlit_app.py
+.venv/bin/streamlit run scripts/app.py
 ```
 
-- **검색 탭**: 청크에 포함된 대사에서 키워드 매칭 → 영상 링크·제목·발췌  
-- **분석 탭**: `published_at` 기준 월별 업로드 수·조회수 합 (간단 성장 그래프)
+- **채팅**: 사이드바에서 채널(뜬뜬·쑥쑥 등)을 켠 뒤 키워드로 질문 → 청크 대사 매칭·링크·발췌  
+- **사이드바**: 검색 결과 개수, (선택) 청크 경로 덮어쓰기, **월별 업로드·조회수** 접기 패널  
+- 다크 테마는 `.streamlit/config.toml` 기준 (프로젝트에 포함)
 
 ## 다른 채널 (예: ssookssook)
 
