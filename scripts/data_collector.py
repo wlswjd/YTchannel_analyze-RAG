@@ -116,8 +116,9 @@ def append_transcripts(video_data, save_path=None):
 
 if __name__ == "__main__":
     # TARGET_CHANNEL_ID = "UCDNvRZRgvkBTUkQzFoT_8rA"  # 뜬뜬
-    TARGET_CHANNEL_ID = "UC3egV8AyVrnwUEOkGZB-s2Q"  # 쑥쑥 SsookSsook
-    output_filename = "ssookssook_raw_data.json"
+    #TARGET_CHANNEL_ID = "UC3egV8AyVrnwUEOkGZB-s2Q"  # 쑥쑥 SsookSsook
+    TARGET_CHANNEL_ID = "UCQ2O-iftmnlfrBuNsUUTofQ"  # 15ya
+    output_filename = "channel15ya_raw_data.json"
 
     print("1. 업로드 재생목록 ID 조회 중...")
     uploads_playlist_id = get_uploads_playlist_id(TARGET_CHANNEL_ID)
