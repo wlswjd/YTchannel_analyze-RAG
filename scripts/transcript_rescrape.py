@@ -127,8 +127,8 @@ def main():
     parser.add_argument(
         "--input",
         type=Path,
-        default=None,
-        help="입력/출력 JSON (기본: data/raw/ddeunddeun_raw_data.json 등 resolve)",
+        required=True,
+        help="입력/출력 JSON (예: data/raw/ssookssook_raw_data.json)",
     )
     parser.add_argument(
         "--output",
@@ -152,10 +152,7 @@ def main():
     )
     args = parser.parse_args()
 
-    input_path = args.input
-    if input_path is None:
-        input_path = resolve_raw_json("ddeunddeun_raw_data.json")
-    input_path = input_path.resolve()
+    input_path = args.input.resolve()
     output_path = args.output.resolve() if args.output else input_path
 
     data = json.loads(input_path.read_text(encoding="utf-8"))

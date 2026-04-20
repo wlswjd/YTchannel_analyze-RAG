@@ -44,8 +44,8 @@ def main():
     p.add_argument(
         "--input",
         type=Path,
-        default=None,
-        help="수집 완료된 raw JSON (기본: data/raw/ddeunddeun_raw_data.json 또는 루트 레거시)",
+        required=True,
+        help="수집 완료된 raw JSON (예: data/raw/ssookssook_raw_data.json)",
     )
     p.add_argument(
         "--output-dir",
@@ -57,10 +57,7 @@ def main():
     p.add_argument("--overlap", type=int, default=200)
     args = p.parse_args()
 
-    inp = args.input
-    if inp is None:
-        inp = resolve_raw_json("ddeunddeun_raw_data.json")
-    inp = inp.resolve()
+    inp = args.input.resolve()
 
     out_dir = args.output_dir
     if out_dir is None:

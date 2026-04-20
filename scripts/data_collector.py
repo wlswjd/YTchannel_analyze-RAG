@@ -89,7 +89,7 @@ def get_video_details(video_ids):
     return video_data
 
 
-def append_transcripts(video_data):
+def append_transcripts(video_data, save_path=None):
     yt_api = YouTubeTranscriptApi()
     for i, video in enumerate(video_data):
         try:
@@ -101,11 +101,14 @@ def append_transcripts(video_data):
             print(f"[{i+1}/{len(video_data)}] 자막 없음 (무시됨): {video['title']}")
             video["transcript"] = "자막이 제공되지 않는 영상입니다."
         except Exception as e:
-            import traceback
-
-            print(f"[{i+1}/{len(video_data)}] 자막 추출 에러 ({video['video_id']}):")
-            traceback.print_exc()
+            print(f"[{i+1}/{len(video_data)}] 자막 추출 에러 ({video['video_id']}) - IP 차단 등")
             video["transcript"] = "자막 추출 중 에러가 발생했습니다."
+        
+        # 중간 저장 (끊겨도 데이터가 날아가지 않도록)
+        if save_path:
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(video_data, f, ensure_ascii=False, indent=2)
+                
         time.sleep(5)
 
     return video_data
@@ -127,12 +130,19 @@ if __name__ == "__main__":
     filtered_videos = get_video_details(all_video_ids)
     print(f"쇼츠를 제외한 총 {len(filtered_videos)}개의 유효 영상을 확보했습니다.")
 
-    print("4. 자막 데이터 추출 및 병합 중 (시간이 소요됩니다)...")
-    final_data = append_transcripts(filtered_videos)
-
     out_dir = data_raw_dir()
     output_path = out_dir / output_filename
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(final_data, f, ensure_ascii=False, indent=2)
 
-    print(f"\n데이터 수집 완료. '{output_path}'에 저장되었습니다.")
+    # 1차 저장 (메타데이터만 먼저 저장해서, 자막 수집 중단돼도 날아가지 않게 함)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(filtered_videos, f, ensure_ascii=False, indent=2)
+    print(f"-> 메타데이터 1차 저장 완료: {output_path}")
+
+    print("4. 자막 데이터 추출 및 병합 중 (시간이 소요됩니다)...")
+    try:
+        final_data = append_transcripts(filtered_videos, output_path)
+    except KeyboardInterrupt:
+        print("\n[!] 사용자가 강제 종료(Ctrl+C)했습니다. 지금까지 수집된 상태로 저장을 마칩니다.")
+        sys.exit(0)
+
+    print(f"\n데이터 수집 완료. '{output_path}'에 최종 저장되었습니다.")
