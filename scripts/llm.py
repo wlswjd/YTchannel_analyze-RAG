@@ -173,45 +173,91 @@ def generate_episode_answer(query: str, candidates: list[dict]) -> str:
     if not llm_available():
         return _fallback_episode(query, candidates)
 
+    # 중복 영상 제거 (video_id 기준)
+    seen_ids: set[str] = set()
+    unique_candidates: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid not in seen_ids:
+            seen_ids.add(vid)
+            unique_candidates.append(c)
+
+    top = unique_candidates[:6]
+    n = len(top)
+
     lines = []
-    for i, c in enumerate(candidates[:6], 1):
+    for i, c in enumerate(top, 1):
         title = (c.get("title") or "")[:120]
         url = c.get("video_url") or ""
-        excerpt = (c.get("text") or "")[:300].replace("\n", " ").strip()
-        lines.append(f"{i}. 제목: {title}\n   링크: {url}\n   자막: {excerpt}")
+        pub = (c.get("published_at") or "")[:10]
+        excerpt = (c.get("text") or "")[:250].replace("\n", " ").strip()
+        meta = f"   업로드: {pub}" if pub else ""
+        lines.append(f"{i}. 제목: {title}\n   링크: {url}{meta}\n   자막: {excerpt}")
     cand_text = "\n\n".join(lines)
+
+    if n == 1:
+        answer_guide = (
+            "- 해당 영상이 맞는지 자막 근거 1~2문장으로 설명\n"
+            "- 확신이 낮으면 솔직히 밝혀줘"
+        )
+    else:
+        answer_guide = (
+            f"- 후보가 {n}개야. 각 영상이 어떤 내용인지 1줄씩 간략히 소개해줘\n"
+            "- 그 중 질문과 가장 관련 있는 영상을 명확히 추천하고, 이유를 자막 근거로 1~2문장 설명\n"
+            "- 확신이 낮으면 솔직히 밝히고 상위 2~3개를 후보로 제시"
+        )
 
     prompt = f"""너는 유튜브 채널 자막 기반으로 특정 영상을 찾아주는 도우미야.
 
-규칙:
+공통 규칙:
 - 한국어로, 친근하고 간결하게
-- 가장 가능성 높은 영상 1개 추천 + 링크 포함
-- 왜 그 영상인지 자막 근거 1~2문장
-- 확신 낮으면 솔직히 말하고 상위 후보 2~3개 제시
+- 링크는 반드시 마크다운 형식 [제목](링크) 으로 포함
 - 후보에 없는 영상은 절대 지어내지 마
+{answer_guide}
 
 질문: {query}
 
 검색 후보:
 {cand_text}"""
 
-    result = _call(prompt)
-    return result if result else _fallback_episode(query, candidates)
+    result = _call(prompt, max_tokens=1200)
+    return result if result else _fallback_episode(query, unique_candidates)
 
 
 def _fallback_episode(query: str, candidates: list[dict]) -> str:
     if not candidates:
         return "관련 영상을 찾지 못했어요. 다른 키워드로 다시 시도해보세요."
-    top = candidates[0]
-    title = top.get("title", "")
-    url = top.get("video_url", "")
-    excerpt = (top.get("text") or "")[:300]
-    return (
-        f"이 영상일 가능성이 있어요.\n\n"
-        f"**[{title}]({url})**\n\n"
-        f"> {excerpt}\n\n"
-        "출연자 이름, 장소, 음식, 대사 키워드를 더 알려주시면 더 정확히 찾아볼게요."
-    )
+
+    # 중복 제거
+    seen_ids: set[str] = set()
+    unique: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid not in seen_ids:
+            seen_ids.add(vid)
+            unique.append(c)
+
+    if len(unique) == 1:
+        top = unique[0]
+        title = top.get("title", "")
+        url = top.get("video_url", "")
+        excerpt = (top.get("text") or "")[:250]
+        return (
+            f"이 영상일 가능성이 높아요.\n\n"
+            f"**[{title}]({url})**\n\n"
+            f"> {excerpt}\n\n"
+            "출연자 이름, 장소, 음식, 대사 키워드를 더 알려주시면 더 정확히 찾아볼게요."
+        )
+
+    lines = ["관련 후보 영상이 여러 개 찾아졌어요. 아래 중 해당하는 영상이 있는지 확인해보세요!\n"]
+    for i, c in enumerate(unique[:5], 1):
+        title = c.get("title", "")
+        url = c.get("video_url", "")
+        pub = (c.get("published_at") or "")[:10]
+        date_str = f" ({pub})" if pub else ""
+        lines.append(f"{i}. **[{title}]({url})**{date_str}")
+    lines.append("\n출연자 이름, 장소, 음식, 대사 키워드를 더 알려주시면 더 정확히 찾아볼게요.")
+    return "\n".join(lines)
 
 
 # ── 채널 분석 요약 ─────────────────────────────────────────────
