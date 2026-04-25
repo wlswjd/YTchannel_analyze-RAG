@@ -6,5 +6,5 @@ streamlit
 pandas
 chromadb
 sentence-transformers
-google-generativeai
+google-genai
 plotly

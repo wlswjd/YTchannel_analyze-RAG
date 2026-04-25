@@ -187,9 +187,60 @@ def compute_analytics(
     return {"monthly_stats": monthly_stats, "top_videos": top_videos, "stats": stats}
 
 
+# ── 유틸 ─────────────────────────────────────────────────────────────────────
+
+def _fmt_duration(secs) -> str:
+    secs = int(secs or 0)
+    if not secs:
+        return ""
+    h, r = divmod(secs, 3600)
+    m, _ = divmod(r, 60)
+    return f"{h}시간 {m}분" if h else f"{m}분"
+
+
+def _fmt_views(n) -> str:
+    n = int(n or 0)
+    if n >= 10000:
+        return f"{n / 10000:.1f}만"
+    return f"{n:,}"
+
+
 # ── 렌더링 ────────────────────────────────────────────────────────────────────
 
 _COLORS = ["#4f8ef7", "#f76f4f", "#4ff7a8", "#f7c94f"]
+
+
+def _render_episode_candidates(candidates: list[dict]) -> None:
+    """에피소드 검색 결과를 메타데이터 카드로 표시."""
+    # 영상 단위로 중복 제거 (같은 video_id 청크 여러 개 → 하나만)
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid in seen:
+            continue
+        seen.add(vid)
+        unique.append(c)
+
+    if not unique:
+        return
+
+    st.markdown("---")
+    st.caption("관련 영상")
+    for c in unique[:5]:
+        title = c.get("title", "")
+        url = c.get("video_url") or c.get("url", "")
+        views = _fmt_views(c.get("view_count") or 0)
+        pub = (c.get("published_at") or "")[:10]
+        dur = _fmt_duration(c.get("duration_sec") or 0)
+        channel = c.get("_channel_label") or c.get("channel_label", "")
+
+        col_title, col_ch, col_views, col_date, col_dur = st.columns([4, 1.2, 1.2, 1.5, 1])
+        col_title.markdown(f"[{title}]({url})" if url else title)
+        col_ch.caption(channel)
+        col_views.caption(f"👁 {views}")
+        col_date.caption(pub)
+        col_dur.caption(dur)
 
 
 def _render_analytics(msg: dict) -> None:
@@ -279,6 +330,10 @@ def _render_message(msg: dict) -> None:
     with st.chat_message(msg["role"]):
         if msg.get("type") == "analytics":
             _render_analytics(msg)
+        elif msg.get("type") == "episode":
+            st.markdown(msg.get("content", ""))
+            if msg.get("candidates"):
+                _render_episode_candidates(msg["candidates"])
         else:
             st.markdown(msg.get("content", ""))
 
@@ -354,7 +409,12 @@ def handle_query(query: str, enabled: list[dict]) -> dict:
     # ── 에피소드 검색 ──
     results = run_episode_search(query, target, n=8)
     answer = generate_episode_answer(query, results)
-    return {"role": "assistant", "type": "text", "content": answer}
+    return {
+        "role": "assistant",
+        "type": "episode",
+        "content": answer,
+        "candidates": results,
+    }
 
 
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
@@ -368,23 +428,23 @@ def _sidebar() -> list[dict]:
         key = f"ch_{ch['id']}"
 
         if key not in st.session_state:
-            st.session_state[key] = has_raw
+            st.session_state[key] = has_raw and ch["id"] != "channel15ya"
 
         label = ch["label"]
         if has_raw and not has_chunks:
-            help_txt = "의미 검색 인덱스 없음 — 키워드 검색으로 동작합니다"
+            help_txt = "키워드 검색만 가능 (벡터 인덱스 없음)"
         elif not has_raw:
-            help_txt = "데이터 없음 — data_collector.py 실행 필요"
+            help_txt = "데이터 없음"
         else:
-            help_txt = ""
+            help_txt = None
 
-        st.toggle(label, key=key, disabled=not has_raw, help=help_txt or None)
+        st.checkbox(label, key=key, disabled=not has_raw, help=help_txt)
         if st.session_state.get(key):
             selected.append(ch)
 
     if not llm_available():
         st.divider()
-        st.info("`.env` 에 `ANTHROPIC_API_KEY` 를 추가하면 AI 답변이 활성화됩니다.")
+        st.info("`.env` 에 `GEMINI_API_KEY` 를 추가하면 AI 답변이 활성화됩니다.")
 
     return selected
 
@@ -438,6 +498,10 @@ def main() -> None:
         with st.chat_message("assistant"):
             if response.get("type") == "analytics":
                 _render_analytics(response)
+            elif response.get("type") == "episode":
+                st.markdown(response.get("content", ""))
+                if response.get("candidates"):
+                    _render_episode_candidates(response["candidates"])
             else:
                 st.markdown(response.get("content", ""))
 
