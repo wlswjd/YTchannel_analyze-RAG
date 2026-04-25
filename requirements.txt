@@ -4,3 +4,6 @@ isodate
 youtube-transcript-api
 streamlit
 pandas
+chromadb
+sentence-transformers
+google-generativeai

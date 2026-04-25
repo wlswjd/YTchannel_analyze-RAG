@@ -33,6 +33,7 @@ env/
 ddeunddeun_raw_data_with_transcripts.json
 data/processed/
 chroma_db/
+.hf_cache/
 
 # Temporary subtitle downloads / caches
 .tmp_subs/

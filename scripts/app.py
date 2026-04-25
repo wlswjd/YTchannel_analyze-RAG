@@ -15,30 +15,9 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import ROOT, data_processed_dir, resolve_raw_json  # noqa: E402
-
-# 새 채널 추가 시 여기만 확장하면 됨 (raw 파일명 = chunk_data.py 출력 규칙과 동일)
-CHANNELS: list[dict] = [
-    {
-        "id": "ddeunddeun",
-        "label": "뜬뜬",
-        "raw_file": "ddeunddeun_raw_data.json",
-    },
-    {
-        "id": "ssookssook",
-        "label": "쑥쑥",
-        "raw_file": "ssookssook_raw_data.json",
-    },
-]
-
-
-def raw_path(ch: dict) -> Path:
-    return resolve_raw_json(ch["raw_file"])
-
-
-def chunks_path(ch: dict) -> Path:
-    stem = Path(ch["raw_file"]).stem
-    return data_processed_dir() / f"{stem}_chunks.jsonl"
-
+from vector_store import DEFAULT_MODEL, semantic_search  # noqa: E402
+from channels import CHANNELS, chunks_path, raw_path  # noqa: E402
+from llm import fallback_answer, generate_llm_answer, llm_available  # noqa: E402
 
 @st.cache_data(show_spinner=False)
 def _load_chunks_file(path_str: str) -> list[dict] | None:
@@ -176,7 +155,28 @@ def sidebar_channels() -> list[dict]:
 
 def sidebar_settings() -> int:
     st.subheader("설정")
+    st.radio(
+        "답변 스타일",
+        options=["리스트(근거 보기)", "LLM처럼 요약 답변"],
+        index=0,
+        key="answer_style",
+        help="LLM처럼 요약 답변은 (선택) Gemini API 키가 있을 때 더 자연스럽게 답해줍니다.",
+    )
+    st.radio(
+        "검색 모드",
+        options=["키워드(빠름)", "의미(질문형)"],
+        index=0,
+        key="search_mode",
+        help="키워드는 현재처럼 문자열 포함 검색. 의미 검색은 임베딩 기반이라 질문형 문장에 더 강하지만 인덱스가 필요합니다.",
+    )
     n = st.slider("검색 결과 개수", min_value=3, max_value=50, value=12, step=1)
+    if st.session_state.get("search_mode") == "의미(질문형)":
+        st.caption(
+            "의미 검색은 `python scripts/build_vector_db.py` 로 인덱스를 만든 뒤 사용하세요. "
+            f"(기본 모델: {DEFAULT_MODEL})"
+        )
+    if st.session_state.get("answer_style") == "LLM처럼 요약 답변" and not llm_available():
+        st.warning("LLM 요약 답변을 쓰려면 `.env`에 `GEMINI_API_KEY=...` 를 추가하세요. (없으면 간단 템플릿으로 답합니다)")
     with st.expander("고급 · 경로", expanded=False):
         st.caption("비우면 자동 경로 (`data/raw`, `data/processed`)")
         for ch in CHANNELS:
@@ -278,6 +278,46 @@ def run_search(
     if not enabled:
         return format_reply(query, [], [], False), False
 
+    # semantic search mode (embedding + chroma)
+    if st.session_state.get("search_mode") == "의미(질문형)":
+        channel_ids = [ch["id"] for ch in enabled]
+        hits = semantic_search(channel_ids=channel_ids, query=query, n_results=limit)
+
+        # match format_reply schema
+        normalized = []
+        for h in hits:
+            normalized.append(
+                {
+                    "chunk_id": h.get("chunk_id", ""),
+                    "video_id": h.get("video_id", ""),
+                    "title": h.get("title", ""),
+                    "episode_hint": h.get("episode_hint", ""),
+                    "published_at": h.get("published_at", ""),
+                    "video_url": h.get("video_url", ""),
+                    "chunk_index": h.get("chunk_index", 0),
+                    "text": h.get("text", ""),
+                    "_channel_label": h.get("channel_label", ""),
+                }
+            )
+        if st.session_state.get("answer_style") == "LLM처럼 요약 답변":
+            llm_text = generate_llm_answer(query, normalized)
+            if llm_text:
+                return llm_text, False
+            return fallback_answer(query, normalized), False
+
+        if not normalized:
+            return (
+                "의미 검색 결과가 없습니다. 아직 인덱스가 없을 수 있어요.\n\n"
+                "아래를 먼저 실행해 보세요.\n\n"
+                "```bash\n"
+                "pip install -r requirements.txt\n"
+                "python scripts/build_vector_db.py\n"
+                "```\n",
+                False,
+            )
+        reply = format_reply(query, normalized, labels, False)
+        return reply, False
+
     per_hits: list[list[dict]] = []
     title_only_rows: list[dict] = []
     no_chunk_channels: list[str] = []
@@ -293,6 +333,12 @@ def run_search(
 
     if per_hits:
         merged = combine_hits(per_hits, query, limit)
+        if st.session_state.get("answer_style") == "LLM처럼 요약 답변":
+            llm_text = generate_llm_answer(query, merged)
+            if llm_text:
+                return llm_text, False
+            return fallback_answer(query, merged), False
+
         reply = format_reply(query, merged, labels, False)
         if no_chunk_channels and title_only_rows:
             lines = ["\n\n---\n### 청크 없음 채널 — 제목만 검색\n"]
