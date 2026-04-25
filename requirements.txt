@@ -7,3 +7,4 @@ pandas
 chromadb
 sentence-transformers
 google-generativeai
+plotly

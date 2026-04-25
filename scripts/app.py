@@ -1,7 +1,9 @@
 """
-채널별 청크 키워드 검색 챗봇 UI.
+유튜브 채널 봇.
+  - 에피소드 검색: "이서진이랑 떡국 끓여먹던 편 뭐였지?" → AI가 관련 영상 찾아줌
+  - 채널 분석:    "뜬뜬 채널 25년 1월부터 분석해줘"    → 그래프 + AI 분석 화면 분할
 
-실행 (프로젝트 루트):
+실행:
   streamlit run scripts/app.py
 """
 from __future__ import annotations
@@ -11,396 +13,435 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paths import ROOT, data_processed_dir, resolve_raw_json  # noqa: E402
-from vector_store import DEFAULT_MODEL, semantic_search  # noqa: E402
 from channels import CHANNELS, chunks_path, raw_path  # noqa: E402
-from llm import fallback_answer, generate_llm_answer, llm_available  # noqa: E402
+from llm import (  # noqa: E402
+    detect_intent,
+    generate_analytics_summary,
+    generate_episode_answer,
+    llm_available,
+)
+from vector_store import semantic_search  # noqa: E402
+
+# ── 데이터 로드 ──────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _load_chunks_file(path_str: str) -> list[dict] | None:
-    path = Path(path_str)
-    if not path.exists():
-        return None
+def _load_raw(path_str: str) -> list[dict]:
+    p = Path(path_str)
+    return json.loads(p.read_text("utf-8")) if p.exists() else []
+
+
+@st.cache_data(show_spinner=False)
+def _load_chunks(path_str: str) -> list[dict]:
+    p = Path(path_str)
+    if not p.exists():
+        return []
     rows = []
-    with path.open("r", encoding="utf-8") as f:
+    with p.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+            s = line.strip()
+            if s:
+                rows.append(json.loads(s))
     return rows
 
 
-@st.cache_data(show_spinner=False)
-def _load_raw_file(path_str: str) -> list[dict]:
-    path = Path(path_str)
-    if not path.exists():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
+# ── 검색 ────────────────────────────────────────────────────────────────────
 
-
-def search_chunks(
-    chunks: list[dict], q: str, limit: int, channel_label: str
+def _keyword_search(
+    chunks: list[dict], query: str, limit: int, channel_label: str
 ) -> list[dict]:
-    if not q.strip():
+    """쿼리를 단어 단위로 분리해서 점수 합산 (기존 전체 문자열 매칭 버그 수정)."""
+    keywords = [w for w in query.split() if len(w) >= 2]
+    if not keywords:
         return []
-    q_lower = q.lower()
     hits: list[tuple[float, dict]] = []
     for c in chunks:
         text = (c.get("text") or "").lower()
         title = (c.get("title") or "").lower()
-        if q_lower in text or q_lower in title:
-            score = text.count(q_lower) * 2 + title.count(q_lower) * 3
-            doc = {**c, "_channel_label": channel_label}
-            hits.append((score, doc))
+        score = sum(
+            text.count(kw.lower()) * 2 + title.count(kw.lower()) * 5
+            for kw in keywords
+        )
+        if score > 0:
+            hits.append((score, {**c, "_channel_label": channel_label}))
     hits.sort(key=lambda x: -x[0])
     return [h[1] for h in hits[:limit]]
 
 
-def combine_hits(per_channel: list[list[dict]], query: str, total_limit: int) -> list[dict]:
-    """채널별 히트를 점수 순으로 합치고 chunk_id 기준 중복 제거."""
-    q = query.lower()
-    if not q.strip():
-        return []
-    flat: list[tuple[float, dict]] = []
-    for group in per_channel:
-        for doc in group:
-            text = (doc.get("text") or "").lower()
-            title = (doc.get("title") or "").lower()
-            score = text.count(q) * 2 + title.count(q) * 3
-            flat.append((score, doc))
-    flat.sort(key=lambda x: -x[0])
+def run_episode_search(query: str, enabled: list[dict], n: int = 8) -> list[dict]:
+    """의미 검색 시도 → 실패 시 키워드 검색 fallback."""
+    channel_ids = [ch["id"] for ch in enabled]
+
+    # 1차: 의미 검색 (ChromaDB)
+    try:
+        results = semantic_search(channel_ids=channel_ids, query=query, n_results=n)
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # 2차: 키워드 검색 fallback
+    all_hits: list[dict] = []
+    for ch in enabled:
+        chunks = _load_chunks(str(chunks_path(ch)))
+        if chunks:
+            all_hits.extend(_keyword_search(chunks, query, n * 2, ch["label"]))
+
     seen: set[str] = set()
     out: list[dict] = []
-    for _, doc in flat:
-        cid = str(doc.get("chunk_id") or doc.get("video_id") or "")
+    for item in all_hits:
+        cid = str(item.get("chunk_id") or item.get("video_id") or "")
         if cid in seen:
             continue
         seen.add(cid)
-        out.append(doc)
-        if len(out) >= total_limit:
+        out.append(item)
+        if len(out) >= n:
             break
     return out
 
 
-def analytics_df(videos: list[dict]) -> pd.DataFrame:
-    rows = []
+# ── 채널 분석 통계 계산 ──────────────────────────────────────────────────────
+
+def compute_analytics(
+    videos: list[dict], date_from: str | None, date_to: str | None
+) -> dict | None:
+    filtered = []
     for v in videos:
-        pa = v.get("published_at") or ""
-        if not pa:
+        pub = (v.get("published_at") or "")[:7]
+        if not pub:
             continue
-        try:
-            dt = pd.to_datetime(pa, utc=True)
-        except Exception:
+        if date_from and pub < date_from:
             continue
-        rows.append(
-            {
-                "month": dt.to_period("M").to_timestamp(),
-                "published_at": dt,
-                "view_count": int(v.get("view_count") or 0),
-                "title": v.get("title", ""),
-                "video_url": v.get("video_url", ""),
-            }
-        )
-    return pd.DataFrame(rows)
+        if date_to and pub > date_to:
+            continue
+        filtered.append(v)
 
+    if not filtered:
+        return None
 
-def inject_style() -> None:
-    st.markdown(
-        """
-        <style>
-        /* 다크 톤 보조 (Streamlit 다크 테마와 함께 사용) */
-        .block-container { padding-top: 1rem; }
-        div[data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+    # 월별 집계
+    monthly: dict[str, dict] = {}
+    for v in filtered:
+        month = (v.get("published_at") or "")[:7]
+        if not month:
+            continue
+        if month not in monthly:
+            monthly[month] = {"uploads": 0, "views": 0}
+        monthly[month]["uploads"] += 1
+        monthly[month]["views"] += int(v.get("view_count") or 0)
+
+    monthly_stats = [
+        {"month": k, "uploads": v["uploads"], "views": v["views"]}
+        for k, v in sorted(monthly.items())
+    ]
+
+    total_views = sum(int(v.get("view_count") or 0) for v in filtered)
+
+    # TOP 영상
+    top_sorted = sorted(filtered, key=lambda x: int(x.get("view_count") or 0), reverse=True)
+    top_videos = [
+        {
+            "title": v["title"][:45] + ("…" if len(v.get("title", "")) > 45 else ""),
+            "url": v.get("video_url", ""),
+            "views": int(v.get("view_count") or 0),
         }
-        </style>
-        """,
-        unsafe_allow_html=True,
+        for v in top_sorted[:10]
+    ]
+
+    # 추이 (전반기 vs 후반기 평균 조회수 비교)
+    mid = len(monthly_stats) // 2
+    if mid >= 2:
+        first_avg = sum(m["views"] for m in monthly_stats[:mid]) / mid
+        second_avg = sum(m["views"] for m in monthly_stats[mid:]) / (len(monthly_stats) - mid)
+        if second_avg > first_avg * 1.15:
+            trend = "상승 추세 📈"
+        elif second_avg < first_avg * 0.85:
+            trend = "하락 추세 📉"
+        else:
+            trend = "안정적 ➡️"
+    else:
+        trend = "데이터 부족"
+
+    best_month = (
+        max(monthly_stats, key=lambda x: x["uploads"])["month"] if monthly_stats else ""
     )
+    actual_from = monthly_stats[0]["month"] if monthly_stats else (date_from or "")
+    actual_to = monthly_stats[-1]["month"] if monthly_stats else (date_to or "")
+
+    stats = {
+        "total_videos": len(filtered),
+        "total_views": total_views,
+        "avg_views": total_views / len(filtered) if filtered else 0,
+        "top_video_title": top_sorted[0]["title"] if top_sorted else "",
+        "top_video_views": int(top_sorted[0].get("view_count") or 0) if top_sorted else 0,
+        "avg_monthly_uploads": len(filtered) / len(monthly_stats) if monthly_stats else 0,
+        "best_month": best_month,
+        "trend_description": trend,
+        "date_from": actual_from,
+        "date_to": actual_to,
+    }
+
+    return {"monthly_stats": monthly_stats, "top_videos": top_videos, "stats": stats}
 
 
-def sidebar_about() -> None:
-    st.markdown("### 유튜브 대사 검색")
-    st.caption("수집한 자막 청크에서 키워드를 찾아 영상 링크와 발췌를 보여 줍니다.")
+# ── 렌더링 ────────────────────────────────────────────────────────────────────
+
+_COLORS = ["#4f8ef7", "#f76f4f", "#4ff7a8", "#f7c94f"]
+
+
+def _render_analytics(msg: dict) -> None:
+    """분석 결과를 좌(차트) / 우(AI 요약) 분할 화면으로 렌더링."""
+    monthly_stats: list[dict] = msg.get("monthly_stats", [])
+    top_videos: list[dict] = msg.get("top_videos", [])
+    stats: dict = msg.get("stats", {})
+    summary: str = msg.get("summary", "")
+    channel_label: str = msg.get("channel_label", "")
+
     st.markdown(
-        "채널을 켜고 질문하면, **켜진 채널 범위**에서만 검색합니다. "
-        "청크는 `python scripts/chunk_data.py --input data/raw/…json` 으로 만듭니다."
+        f"#### {channel_label} · {stats.get('date_from')} ~ {stats.get('date_to')}"
     )
 
+    col_charts, col_summary = st.columns([1.3, 1], gap="large")
 
-def sidebar_channels() -> list[dict]:
-    st.subheader("검색 범위 (채널)")
+    # ── 왼쪽: 차트 ──
+    with col_charts:
+        if monthly_stats:
+            df = pd.DataFrame(monthly_stats)
+
+            fig_up = px.bar(
+                df, x="month", y="uploads",
+                title="월별 업로드 수",
+                labels={"month": "", "uploads": "편"},
+                color_discrete_sequence=[_COLORS[0]],
+            )
+            fig_up.update_layout(
+                height=220, margin=dict(t=35, b=5, l=0, r=0), showlegend=False
+            )
+            fig_up.update_xaxes(tickangle=-45, tickfont_size=10)
+            st.plotly_chart(fig_up, use_container_width=True)
+
+            fig_vw = px.line(
+                df, x="month", y="views",
+                title="월별 조회수",
+                labels={"month": "", "views": "조회수"},
+                markers=True,
+                color_discrete_sequence=[_COLORS[1]],
+            )
+            fig_vw.update_layout(
+                height=220, margin=dict(t=35, b=5, l=0, r=0), showlegend=False
+            )
+            fig_vw.update_xaxes(tickangle=-45, tickfont_size=10)
+            st.plotly_chart(fig_vw, use_container_width=True)
+
+        if top_videos:
+            df_top = pd.DataFrame(top_videos[:8])
+            fig_top = px.bar(
+                df_top, x="views", y="title",
+                orientation="h",
+                title="조회수 TOP 영상",
+                labels={"views": "조회수", "title": ""},
+                color_discrete_sequence=[_COLORS[2]],
+            )
+            fig_top.update_layout(height=300, margin=dict(t=35, b=5, l=0, r=10))
+            fig_top.update_yaxes(tickfont_size=10, autorange="reversed")
+            st.plotly_chart(fig_top, use_container_width=True)
+
+    # ── 오른쪽: AI 요약 ──
+    with col_summary:
+        st.markdown("##### 핵심 지표")
+        r1c1, r1c2 = st.columns(2)
+        r1c1.metric("총 영상", f"{stats.get('total_videos', 0)}편")
+        r1c2.metric("총 조회수", f"{stats.get('total_views', 0):,}")
+        r2c1, r2c2 = st.columns(2)
+        r2c1.metric("평균 조회수", f"{int(stats.get('avg_views', 0)):,}")
+        r2c2.metric("월평균 업로드", f"{stats.get('avg_monthly_uploads', 0):.1f}편")
+
+        trend = stats.get("trend_description", "")
+        if trend:
+            st.caption(f"조회수 추이: {trend}")
+
+        st.divider()
+        st.markdown("##### AI 분석")
+        st.markdown(summary)
+
+        if top_videos:
+            st.divider()
+            st.markdown("##### 최고 조회수 영상")
+            top = top_videos[0]
+            st.markdown(f"[{top['title']}]({top['url']})")
+            st.caption(f"{top['views']:,}회")
+
+
+def _render_message(msg: dict) -> None:
+    with st.chat_message(msg["role"]):
+        if msg.get("type") == "analytics":
+            _render_analytics(msg)
+        else:
+            st.markdown(msg.get("content", ""))
+
+
+# ── 쿼리 처리 ─────────────────────────────────────────────────────────────────
+
+def _resolve_target_channels(intent_info: dict, sidebar_enabled: list[dict]) -> list[dict]:
+    """intent에서 채널 명시 → 해당 채널, 없으면 사이드바 선택."""
+    ids = intent_info.get("channel_ids")
+    if ids:
+        matched = [ch for ch in CHANNELS if ch["id"] in set(ids)]
+        if matched:
+            return matched
+    return sidebar_enabled
+
+
+def handle_query(query: str, enabled: list[dict]) -> dict:
+    """쿼리를 처리해서 메시지 dict 반환."""
+    if not enabled:
+        return {
+            "role": "assistant",
+            "type": "text",
+            "content": "왼쪽 사이드바에서 검색할 채널을 하나 이상 선택해 주세요.",
+        }
+
+    intent_info = detect_intent(query, [ch["label"] for ch in CHANNELS])
+    intent = intent_info.get("intent", "episode_search")
+    target = _resolve_target_channels(intent_info, enabled)
+
+    # ── 채널 분석 ──
+    if intent == "analytics":
+        date_from = intent_info.get("date_from")
+        date_to = intent_info.get("date_to")
+
+        all_videos: list[dict] = []
+        used_labels: list[str] = []
+        for ch in target:
+            vids = _load_raw(str(raw_path(ch)))
+            if vids:
+                all_videos.extend(vids)
+                used_labels.append(ch["label"])
+
+        if not all_videos:
+            return {
+                "role": "assistant",
+                "type": "text",
+                "content": "분석할 데이터가 없습니다. 먼저 데이터를 수집해 주세요.",
+            }
+
+        analytics = compute_analytics(all_videos, date_from, date_to)
+        if analytics is None:
+            period = f"{date_from} ~ {date_to}" if date_from else "전체 기간"
+            return {
+                "role": "assistant",
+                "type": "text",
+                "content": f"해당 기간({period})에 해당하는 영상이 없습니다.",
+            }
+
+        channel_label = " · ".join(used_labels)
+        summary_stats = {**analytics["stats"], "channel_label": channel_label}
+        summary = generate_analytics_summary(query, summary_stats)
+
+        return {
+            "role": "assistant",
+            "type": "analytics",
+            "channel_label": channel_label,
+            "monthly_stats": analytics["monthly_stats"],
+            "top_videos": analytics["top_videos"],
+            "stats": analytics["stats"],
+            "summary": summary,
+        }
+
+    # ── 에피소드 검색 ──
+    results = run_episode_search(query, target, n=8)
+    answer = generate_episode_answer(query, results)
+    return {"role": "assistant", "type": "text", "content": answer}
+
+
+# ── 사이드바 ──────────────────────────────────────────────────────────────────
+
+def _sidebar() -> list[dict]:
+    st.markdown("### 채널 선택")
     selected: list[dict] = []
     for ch in CHANNELS:
-        cp = chunks_path(ch)
-        has_chunks = cp.exists()
-        key = f"use_channel_{ch['id']}"
+        has_raw = raw_path(ch).exists()
+        has_chunks = chunks_path(ch).exists()
+        key = f"ch_{ch['id']}"
+
         if key not in st.session_state:
-            st.session_state[key] = has_chunks and ch["id"] == "ddeunddeun"
+            st.session_state[key] = has_raw
 
-        help_txt = f"청크: `data/processed/{cp.name}`"
-        if not has_chunks:
-            help_txt += " (아직 없음 — 청크 생성 후 검색 가능)"
+        label = ch["label"]
+        if has_raw and not has_chunks:
+            help_txt = "의미 검색 인덱스 없음 — 키워드 검색으로 동작합니다"
+        elif not has_raw:
+            help_txt = "데이터 없음 — data_collector.py 실행 필요"
+        else:
+            help_txt = ""
 
-        st.toggle(ch["label"], key=key, help=help_txt)
-
-        if st.session_state[key]:
+        st.toggle(label, key=key, disabled=not has_raw, help=help_txt or None)
+        if st.session_state.get(key):
             selected.append(ch)
+
+    if not llm_available():
+        st.divider()
+        st.info("`.env` 에 `ANTHROPIC_API_KEY` 를 추가하면 AI 답변이 활성화됩니다.")
 
     return selected
 
 
-def sidebar_settings() -> int:
-    st.subheader("설정")
-    st.radio(
-        "답변 스타일",
-        options=["리스트(근거 보기)", "LLM처럼 요약 답변"],
-        index=0,
-        key="answer_style",
-        help="LLM처럼 요약 답변은 (선택) Gemini API 키가 있을 때 더 자연스럽게 답해줍니다.",
-    )
-    st.radio(
-        "검색 모드",
-        options=["키워드(빠름)", "의미(질문형)"],
-        index=0,
-        key="search_mode",
-        help="키워드는 현재처럼 문자열 포함 검색. 의미 검색은 임베딩 기반이라 질문형 문장에 더 강하지만 인덱스가 필요합니다.",
-    )
-    n = st.slider("검색 결과 개수", min_value=3, max_value=50, value=12, step=1)
-    if st.session_state.get("search_mode") == "의미(질문형)":
-        st.caption(
-            "의미 검색은 `python scripts/build_vector_db.py` 로 인덱스를 만든 뒤 사용하세요. "
-            f"(기본 모델: {DEFAULT_MODEL})"
-        )
-    if st.session_state.get("answer_style") == "LLM처럼 요약 답변" and not llm_available():
-        st.warning("LLM 요약 답변을 쓰려면 `.env`에 `GEMINI_API_KEY=...` 를 추가하세요. (없으면 간단 템플릿으로 답합니다)")
-    with st.expander("고급 · 경로", expanded=False):
-        st.caption("비우면 자동 경로 (`data/raw`, `data/processed`)")
-        for ch in CHANNELS:
-            st.text_input(
-                f"{ch['label']} 청크 .jsonl (선택)",
-                value="",
-                key=f"override_chunks_{ch['id']}",
-                placeholder=str(chunks_path(ch)),
-            )
-    return n
-
-
-def resolve_chunk_path(ch: dict) -> Path:
-    o = st.session_state.get(f"override_chunks_{ch['id']}", "").strip()
-    if o:
-        return Path(o).expanduser().resolve()
-    return chunks_path(ch)
-
-
-def sidebar_stats(enabled: list[dict]) -> None:
-    with st.expander("월별 업로드 · 조회수", expanded=False):
-        all_v: list[dict] = []
-        for ch in enabled:
-            rp = raw_path(ch)
-            all_v.extend(_load_raw_file(str(rp)))
-        if not all_v:
-            st.info("켜진 채널에 Raw JSON이 없거나 비어 있습니다.")
-            return
-        df = analytics_df(all_v)
-        if df.empty:
-            st.warning("published_at 이 있는 영상이 없습니다.")
-            return
-        monthly = (
-            df.groupby(df["month"].dt.to_period("M"))
-            .agg(uploads=("title", "count"), views=("view_count", "sum"))
-            .reset_index()
-        )
-        monthly["month"] = monthly["month"].astype(str)
-        st.line_chart(monthly.set_index("month")[["uploads", "views"]])
-        st.dataframe(monthly, use_container_width=True, hide_index=True)
-
-
-def format_reply(
-    query: str, hits: list[dict], enabled_labels: list[str], title_only: bool
-) -> str:
-    if not enabled_labels:
-        return "사이드바에서 **검색할 채널**을 하나 이상 켜 주세요. (청크 파일이 있는 채널만 켤 수 있습니다.)"
-
-    if title_only:
-        lines = [
-            f"청크가 없어 **제목**만 검색했습니다. (범위: {', '.join(enabled_labels)})",
-            "",
-        ]
-        for i, v in enumerate(hits[:20], 1):
-            t = v.get("title", "")
-            u = v.get("video_url", "")
-            lines.append(f"{i}. [{t}]({u})")
-        return "\n".join(lines)
-
-    if not hits:
-        return (
-            f"「{query}」와 맞는 대사/제목이 없습니다. "
-            f"(검색 채널: {', '.join(enabled_labels)})"
-        )
-
-    lines = [
-        f"**「{query}」** 검색 · 채널: {', '.join(enabled_labels)}",
-        "",
-    ]
-    for i, c in enumerate(hits, 1):
-        title = (c.get("title") or "")[:120]
-        url = c.get("video_url", "")
-        ep = c.get("episode_hint") or "—"
-        ch_lab = c.get("_channel_label", "")
-        excerpt = (c.get("text") or "")[:900]
-        lines.append(f"**{i}.** [{title}]({url}) · *{ch_lab}* · EP? {ep}")
-        lines.append(f"> {excerpt}")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _title_hits_for_channel(ch: dict, query: str) -> list[dict]:
-    raw_p = raw_path(ch)
-    videos = _load_raw_file(str(raw_p))
-    q = query.lower()
-    out: list[dict] = []
-    for v in videos:
-        if q in (v.get("title") or "").lower():
-            out.append({**v, "_channel_label": ch["label"]})
-    return out
-
-
-def run_search(
-    query: str, enabled: list[dict], limit: int
-) -> tuple[str, bool]:
-    """Returns (markdown reply, used_title_only)."""
-    labels = [ch["label"] for ch in enabled]
-
-    if not enabled:
-        return format_reply(query, [], [], False), False
-
-    # semantic search mode (embedding + chroma)
-    if st.session_state.get("search_mode") == "의미(질문형)":
-        channel_ids = [ch["id"] for ch in enabled]
-        hits = semantic_search(channel_ids=channel_ids, query=query, n_results=limit)
-
-        # match format_reply schema
-        normalized = []
-        for h in hits:
-            normalized.append(
-                {
-                    "chunk_id": h.get("chunk_id", ""),
-                    "video_id": h.get("video_id", ""),
-                    "title": h.get("title", ""),
-                    "episode_hint": h.get("episode_hint", ""),
-                    "published_at": h.get("published_at", ""),
-                    "video_url": h.get("video_url", ""),
-                    "chunk_index": h.get("chunk_index", 0),
-                    "text": h.get("text", ""),
-                    "_channel_label": h.get("channel_label", ""),
-                }
-            )
-        if st.session_state.get("answer_style") == "LLM처럼 요약 답변":
-            llm_text = generate_llm_answer(query, normalized)
-            if llm_text:
-                return llm_text, False
-            return fallback_answer(query, normalized), False
-
-        if not normalized:
-            return (
-                "의미 검색 결과가 없습니다. 아직 인덱스가 없을 수 있어요.\n\n"
-                "아래를 먼저 실행해 보세요.\n\n"
-                "```bash\n"
-                "pip install -r requirements.txt\n"
-                "python scripts/build_vector_db.py\n"
-                "```\n",
-                False,
-            )
-        reply = format_reply(query, normalized, labels, False)
-        return reply, False
-
-    per_hits: list[list[dict]] = []
-    title_only_rows: list[dict] = []
-    no_chunk_channels: list[str] = []
-
-    for ch in enabled:
-        cp = resolve_chunk_path(ch)
-        chunks = _load_chunks_file(str(cp))
-        if chunks:
-            per_hits.append(search_chunks(chunks, query, limit * 2, ch["label"]))
-        else:
-            no_chunk_channels.append(ch["label"])
-            title_only_rows.extend(_title_hits_for_channel(ch, query))
-
-    if per_hits:
-        merged = combine_hits(per_hits, query, limit)
-        if st.session_state.get("answer_style") == "LLM처럼 요약 답변":
-            llm_text = generate_llm_answer(query, merged)
-            if llm_text:
-                return llm_text, False
-            return fallback_answer(query, merged), False
-
-        reply = format_reply(query, merged, labels, False)
-        if no_chunk_channels and title_only_rows:
-            lines = ["\n\n---\n### 청크 없음 채널 — 제목만 검색\n"]
-            for i, v in enumerate(title_only_rows[:8], 1):
-                t = v.get("title", "")
-                u = v.get("video_url", "")
-                lab = v.get("_channel_label", "")
-                lines.append(f"{i}. [{t}]({u}) · *{lab}*")
-            reply += "\n".join(lines)
-        elif no_chunk_channels:
-            reply += (
-                "\n\n---\n**참고:** "
-                + ", ".join(f"*{c}*" for c in no_chunk_channels)
-                + " 채널은 아직 청크 파일이 없어 대사 검색에서 빠졌습니다. "
-                "`python scripts/chunk_data.py` 로 jsonl을 만든 뒤 다시 시도해 보세요."
-            )
-        return reply, False
-
-    if title_only_rows:
-        title_only_rows = title_only_rows[:limit]
-        return format_reply(query, title_only_rows, labels, True), True
-
-    return format_reply(query, [], labels, False), False
-
+# ── 메인 ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     st.set_page_config(
-        page_title="채널 대사 검색",
+        page_title="유튜브 채널 봇",
+        page_icon="▶️",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    inject_style()
 
     with st.sidebar:
-        sidebar_about()
-        st.divider()
-        enabled = sidebar_channels()
-        st.divider()
-        limit = sidebar_settings()
-        st.divider()
-        sidebar_stats(enabled)
-
-    st.markdown("## 대사 검색 챗봇")
-    st.caption("키워드·짧은 문장을 입력하면 수집 자막 청크에서 찾아 줍니다.")
+        enabled = _sidebar()
 
     if "messages" not in st.session_state:
         st.session_state.messages = [
             {
                 "role": "assistant",
-                "content": "안녕하세요. 왼쪽에서 **검색할 채널**을 켠 뒤, 찾고 싶은 단어나 장면을 입력해 보세요.",
+                "type": "text",
+                "content": (
+                    "안녕하세요! 유튜브 채널 봇입니다.\n\n"
+                    "**에피소드 검색** — 기억이 가물가물한 편을 찾아드려요\n"
+                    "> 예: *이서진이랑 떡국 끓여먹던 편이 뭐였지?*\n\n"
+                    "**채널 분석** — 기간별 통계와 AI 인사이트를 보여드려요\n"
+                    "> 예: *뜬뜬 채널 25년 4월부터 26년 4월까지 분석해줘*\n\n"
+                    "왼쪽에서 검색할 채널을 선택해 주세요."
+                ),
             }
         ]
 
-    if prompt := st.chat_input("대사·키워드로 질문…"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.spinner("청크 검색 중…"):
-            reply, _ = run_search(prompt, enabled, limit)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+    st.markdown("## ▶️ 유튜브 채널 봇")
 
+    # 이전 메시지 렌더링
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        _render_message(msg)
+
+    # 새 입력 처리
+    if prompt := st.chat_input("에피소드 검색 또는 채널 분석을 질문해보세요"):
+        # 사용자 메시지 즉시 렌더링
+        st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # 응답 계산 및 렌더링
+        with st.spinner("분석 중..."):
+            response = handle_query(prompt, enabled)
+
+        with st.chat_message("assistant"):
+            if response.get("type") == "analytics":
+                _render_analytics(response)
+            else:
+                st.markdown(response.get("content", ""))
+
+        st.session_state.messages.append(response)
 
 
 if __name__ == "__main__":
