@@ -166,6 +166,32 @@ def compute_analytics(
         for v in top_sorted[:10]
     ]
 
+    # 조회수 구간 분포 (도넛 차트 데이터)
+    bucket_defs: list[tuple[str, int, int]] = [
+        ("1000만 이상", 10_000_000, 10**12),
+        ("100만 ~ 1000만", 1_000_000, 10_000_000),
+        ("10만 ~ 100만", 100_000, 1_000_000),
+        ("10만 미만", 0, 100_000),
+    ]
+    view_distribution: list[dict] = []
+    for label, lo, hi in bucket_defs:
+        bucket_videos = [
+            v for v in filtered if lo <= int(v.get("view_count") or 0) < hi
+        ]
+        if not bucket_videos:
+            continue
+        view_distribution.append(
+            {
+                "bucket": label,
+                "count": len(bucket_videos),
+                "views": sum(int(v.get("view_count") or 0) for v in bucket_videos),
+            }
+        )
+
+    # TOP10 점유율 (전체 조회수 중 상위 10편 비중)
+    top10_views = sum(int(v.get("view_count") or 0) for v in top_sorted[:10])
+    top10_share = (top10_views / total_views * 100) if total_views else 0.0
+
     # 추이 (전반기 vs 후반기 평균 조회수 비교)
     mid = len(monthly_stats) // 2
     if mid >= 2:
@@ -197,9 +223,15 @@ def compute_analytics(
         "trend_description": trend,
         "date_from": actual_from,
         "date_to": actual_to,
+        "top10_share": top10_share,
     }
 
-    return {"monthly_stats": monthly_stats, "top_videos": top_videos, "stats": stats}
+    return {
+        "monthly_stats": monthly_stats,
+        "top_videos": top_videos,
+        "view_distribution": view_distribution,
+        "stats": stats,
+    }
 
 
 # ── 유틸 ─────────────────────────────────────────────────────────────────────
@@ -226,8 +258,9 @@ _COLORS = ["#4f8ef7", "#f76f4f", "#4ff7a8", "#f7c94f"]
 
 
 def _render_episode_candidates(candidates: list[dict]) -> None:
-    """에피소드 검색 결과를 메타데이터 카드로 표시."""
-    # 영상 단위로 중복 제거 (같은 video_id 청크 여러 개 → 하나만)
+    """에피소드 검색 후보를 카드로 표시.
+    1번(가장 점수 높은 영상)은 LLM 답변 본문에 이미 들어가 있으므로 여기선 제외하고,
+    나머지를 접힘(expander) 안에 넣어 답변에 집중하도록 함."""
     seen: set[str] = set()
     unique: list[dict] = []
     for c in candidates:
@@ -237,31 +270,34 @@ def _render_episode_candidates(candidates: list[dict]) -> None:
         seen.add(vid)
         unique.append(c)
 
-    if not unique:
+    if len(unique) <= 1:
         return
 
-    st.markdown("---")
-    st.caption("관련 영상")
-    for c in unique[:5]:
-        title = c.get("title", "")
-        url = c.get("video_url") or c.get("url", "")
-        views = _fmt_views(c.get("view_count") or 0)
-        pub = (c.get("published_at") or "")[:10]
-        dur = _fmt_duration(c.get("duration_sec") or 0)
-        channel = c.get("_channel_label") or c.get("channel_label", "")
+    others = unique[1:5]
+    with st.expander(f"다른 후보 영상 {len(others)}개 보기"):
+        for c in others:
+            title = c.get("title", "")
+            url = c.get("video_url") or c.get("url", "")
+            views = _fmt_views(c.get("view_count") or 0)
+            pub = (c.get("published_at") or "")[:10]
+            dur = _fmt_duration(c.get("duration_sec") or 0)
+            channel = c.get("_channel_label") or c.get("channel_label", "")
 
-        col_title, col_ch, col_views, col_date, col_dur = st.columns([4, 1.2, 1.2, 1.5, 1])
-        col_title.markdown(f"[{title}]({url})" if url else title)
-        col_ch.caption(channel)
-        col_views.caption(f"👁 {views}")
-        col_date.caption(pub)
-        col_dur.caption(dur)
+            col_title, col_ch, col_views, col_date, col_dur = st.columns(
+                [4, 1.2, 1.2, 1.5, 1]
+            )
+            col_title.markdown(f"[{title}]({url})" if url else title)
+            col_ch.caption(channel)
+            col_views.caption(f"👁 {views}")
+            col_date.caption(pub)
+            col_dur.caption(dur)
 
 
 def _render_analytics(msg: dict) -> None:
     """분석 결과를 좌(차트) / 우(AI 요약) 분할 화면으로 렌더링."""
     monthly_stats: list[dict] = msg.get("monthly_stats", [])
     top_videos: list[dict] = msg.get("top_videos", [])
+    view_distribution: list[dict] = msg.get("view_distribution", [])
     stats: dict = msg.get("stats", {})
     summary: str = msg.get("summary", "")
     channel_label: str = msg.get("channel_label", "")
@@ -314,6 +350,56 @@ def _render_analytics(msg: dict) -> None:
             fig_top.update_layout(height=300, margin=dict(t=35, b=5, l=0, r=10))
             fig_top.update_yaxes(tickfont_size=10, autorange="reversed")
             st.plotly_chart(fig_top, use_container_width=True)
+
+        # 조회수 구간 분포 도넛 — 콘텐츠 흥행 분포를 한눈에
+        if view_distribution:
+            df_dist = pd.DataFrame(view_distribution)
+            total_videos_in_dist = int(df_dist["count"].sum())
+            fig_donut = px.pie(
+                df_dist,
+                values="count",
+                names="bucket",
+                title="조회수 구간별 영상 분포",
+                hole=0.55,
+                color="bucket",
+                color_discrete_map={
+                    "1000만 이상": "#f76f4f",
+                    "100만 ~ 1000만": "#f7c94f",
+                    "10만 ~ 100만": "#4f8ef7",
+                    "10만 미만": "#7a8a9a",
+                },
+                category_orders={
+                    "bucket": [
+                        "1000만 이상",
+                        "100만 ~ 1000만",
+                        "10만 ~ 100만",
+                        "10만 미만",
+                    ]
+                },
+            )
+            fig_donut.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+                hovertemplate="%{label}<br>%{value}편 (%{percent})<extra></extra>",
+            )
+            fig_donut.update_layout(
+                height=320,
+                margin=dict(t=40, b=10, l=0, r=0),
+                legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"),
+                annotations=[
+                    dict(
+                        text=f"<b>{total_videos_in_dist}</b><br><span style='font-size:11px'>편</span>",
+                        x=0.5, y=0.5, showarrow=False, font=dict(size=18),
+                    )
+                ],
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+            top10_share = stats.get("top10_share", 0)
+            if top10_share:
+                st.caption(
+                    f"💡 TOP 10 영상이 전체 조회수의 **{top10_share:.1f}%** 를 차지하고 있어요."
+                )
 
     # ── 오른쪽: AI 요약 ──
     with col_summary:
@@ -434,7 +520,39 @@ def handle_query(query: str, enabled: list[dict]) -> dict:
 
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
 
+_EXAMPLE_QUERIES = [
+    "이서진이랑 떡국 끓여먹던 편이 뭐였지?",
+    "윤경호 나와서 썰푸는 편이 어떤 편이었지?",
+    "뜬뜬 채널 25년 4월부터 26년 4월까지 분석해줘",
+    "쑥쑥 채널 처음 만들어졌을때부터 지금까지 분석해줘",
+]
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _channel_overview(raw_file_str: str) -> dict:
+    """채널별 영상 수·총 조회수·최근 업로드 일자를 캐시해서 반환."""
+    p = Path(raw_file_str)
+    if not p.exists():
+        return {}
+    try:
+        videos = json.loads(p.read_text("utf-8"))
+    except Exception:
+        return {}
+    if not videos:
+        return {}
+    total_views = sum(int(v.get("view_count") or 0) for v in videos)
+    pub_dates = [(v.get("published_at") or "")[:10] for v in videos]
+    pub_dates = [d for d in pub_dates if d]
+    return {
+        "videos": len(videos),
+        "views": total_views,
+        "latest": max(pub_dates) if pub_dates else "",
+        "earliest": min(pub_dates) if pub_dates else "",
+    }
+
+
 def _sidebar() -> list[dict]:
+    # ── 채널 선택 ──
     st.markdown("### 채널 선택")
     selected: list[dict] = []
     for ch in CHANNELS:
@@ -457,9 +575,54 @@ def _sidebar() -> list[dict]:
         if st.session_state.get(key):
             selected.append(ch)
 
+    st.divider()
+
+    # ── 데이터 현황 (선택된 채널만) ──
+    st.markdown("### 데이터 현황")
+    if not selected:
+        st.caption("채널을 1개 이상 선택해 주세요.")
+    else:
+        for ch in selected:
+            ov = _channel_overview(str(raw_path(ch)))
+            if not ov:
+                st.caption(f"**{ch['label']}** — 데이터 없음")
+                continue
+            views_short = (
+                f"{ov['views'] / 10000:.0f}만회"
+                if ov["views"] >= 10000
+                else f"{ov['views']:,}회"
+            )
+            st.caption(
+                f"**{ch['label']}** — {ov['videos']}편 · {views_short}\n\n"
+                f"📅 {ov['earliest']} ~ {ov['latest']}"
+            )
+
+    st.divider()
+
+    # ── 예시 질문 (클릭 시 채팅창에 자동 입력) ──
+    st.markdown("### 예시 질문")
+    for i, q in enumerate(_EXAMPLE_QUERIES):
+        if st.button(q, key=f"ex_{i}", use_container_width=True):
+            st.session_state["queued_query"] = q
+            st.rerun()
+
+    st.divider()
+
+    # ── 도구 ──
+    if st.button("🗑️ 대화 초기화", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.pop("queued_query", None)
+        st.rerun()
+
     if not llm_available():
-        st.divider()
         st.info("`.env` 에 `GEMINI_API_KEY` 를 추가하면 AI 답변이 활성화됩니다.")
+
+    # ── 푸터 ──
+    st.divider()
+    st.caption(
+        "ⓘ 유튜브 채널 봇 · RAG 기반 영상 검색/분석\n\n"
+        "Powered by Gemini · ChromaDB · Streamlit"
+    )
 
     return selected
 
@@ -501,14 +664,16 @@ def main() -> None:
     for msg in st.session_state.messages:
         _render_message(msg)
 
-    # 새 입력 처리
-    if prompt := st.chat_input("에피소드 검색 또는 채널 분석을 질문해보세요"):
-        # 사용자 메시지 즉시 렌더링
+    # 사이드바에서 예시 질문이 클릭된 경우 자동으로 질의 처리
+    queued = st.session_state.pop("queued_query", None)
+    typed = st.chat_input("에피소드 검색 또는 채널 분석을 질문해보세요")
+    prompt = queued or typed
+
+    if prompt:
         st.session_state.messages.append({"role": "user", "type": "text", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # 응답 계산 및 렌더링
         with st.spinner("분석 중..."):
             response = handle_query(prompt, enabled)
 

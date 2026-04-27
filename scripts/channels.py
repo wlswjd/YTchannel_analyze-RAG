@@ -19,7 +19,7 @@ CHANNELS: list[dict] = [
     },
     {
         "id": "channel15ya",
-        "label": "15야",
+        "label": "채널십오야",
         "raw_file": "channel15ya_raw_data.json",
     },
 ]

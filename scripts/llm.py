@@ -21,22 +21,53 @@ def llm_available() -> bool:
     return bool(os.getenv("GEMINI_API_KEY"))
 
 
-def _call(prompt: str, max_tokens: int = 600) -> str | None:
-    """Gemini 호출. 실패 시 None."""
+def _call(prompt: str, max_tokens: int = 2000) -> str | None:
+    """Gemini 호출. 실패 시 None.
+
+    주의: gemini-2.5-flash 계열은 reasoning 모델이라 `max_output_tokens` 안에
+    thinking 토큰이 같이 들어감. thinking_budget=0 으로 비활성화하고
+    실제 출력 한도를 충분히 줘야 답변이 중간에 잘리지 않는다.
+    """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
     try:
         from google import genai
         from google.genai import types
+
         client = genai.Client(api_key=api_key)
         model_name = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+        # thinking 끄기 시도 (지원하지 않는 모델이면 fallback)
+        try:
+            cfg = types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
+        except Exception:
+            cfg = types.GenerateContentConfig(max_output_tokens=max_tokens)
+
         resp = client.models.generate_content(
             model=model_name,
             contents=prompt,
-            config=types.GenerateContentConfig(max_output_tokens=max_tokens),
+            config=cfg,
         )
+
         text = resp.text
+        # 응답이 토큰 한도로 잘렸는지 감지
+        try:
+            cand = (resp.candidates or [None])[0]
+            finish_reason = getattr(cand, "finish_reason", None) if cand else None
+            if finish_reason and str(finish_reason).endswith("MAX_TOKENS") and not text:
+                # thinking이 다 먹어버린 경우 — 한 번 더 큰 한도로 재시도
+                cfg2 = types.GenerateContentConfig(max_output_tokens=max_tokens * 3)
+                resp = client.models.generate_content(
+                    model=model_name, contents=prompt, config=cfg2
+                )
+                text = resp.text
+        except Exception:
+            pass
+
         return text.strip() if text else None
     except Exception:
         return None
@@ -51,8 +82,9 @@ _CHANNEL_MAP: dict[str, str] = {
     "핑계고": "ddeunddeun",
     "쑥쑥": "ssookssook",
     "쑥덕": "ssookssook",
-    "15야": "channel15ya",
+    "채널십오야": "channel15ya",
     "십오야": "channel15ya",
+    "15야": "channel15ya",
 }
 
 
@@ -129,7 +161,7 @@ def detect_intent(query: str, available_channel_labels: list[str]) -> dict:
     channels_str = ", ".join(available_channel_labels)
     prompt = f"""사용자 질문을 분석해서 JSON만 반환해. 설명 없이 JSON 딱 하나만.
 
-채널 이름 → id: 뜬뜬→ddeunddeun, 쑥쑥→ssookssook, 15야→channel15ya
+채널 이름 → id: 뜬뜬→ddeunddeun, 쑥쑥→ssookssook, 채널십오야(=십오야,15야)→channel15ya
 현재 연도: 2026년
 
 {{
@@ -247,8 +279,10 @@ def generate_episode_answer(query: str, candidates: list[dict]) -> str:
 검색 후보:
 {cand_text}"""
 
-    result = _call(prompt, max_tokens=1200)
-    return result if result else _fallback_episode(query, unique_candidates)
+    result = _call(prompt, max_tokens=2000)
+    if result and len(result.strip()) >= 20:
+        return result
+    return _fallback_episode(query, unique_candidates)
 
 
 def _fallback_episode(query: str, candidates: list[dict]) -> str:
