@@ -24,7 +24,13 @@ from llm import (  # noqa: E402
     generate_episode_answer,
     llm_available,
 )
-from vector_store import semantic_search  # noqa: E402
+from vector_store import get_embedder, semantic_search  # noqa: E402
+
+
+@st.cache_resource(show_spinner="검색 모델 로드 중...")
+def _warm_embedder():
+    """SentenceTransformer를 앱 부팅 시 한 번만 로드해 캐시."""
+    return get_embedder()
 
 # ── 데이터 로드 ──────────────────────────────────────────────────────────────
 
@@ -53,21 +59,30 @@ def _load_chunks(path_str: str) -> list[dict]:
 def _keyword_search(
     chunks: list[dict], query: str, limit: int, channel_label: str
 ) -> list[dict]:
-    """쿼리를 단어 단위로 분리해서 점수 합산 (기존 전체 문자열 매칭 버그 수정)."""
+    """쿼리 단어 단위 매칭. 제목·설명·자막 가중치를 다르게 줌.
+    제목/설명은 인물·테마가 잘 드러나므로 자막보다 높은 가중치."""
     keywords = [w for w in query.split() if len(w) >= 2]
     if not keywords:
         return []
-    hits: list[tuple[float, dict]] = []
+    per_video: dict[str, tuple[float, dict]] = {}
     for c in chunks:
         text = (c.get("text") or "").lower()
         title = (c.get("title") or "").lower()
-        score = sum(
-            text.count(kw.lower()) * 2 + title.count(kw.lower()) * 5
-            for kw in keywords
-        )
-        if score > 0:
-            hits.append((score, {**c, "_channel_label": channel_label}))
-    hits.sort(key=lambda x: -x[0])
+        desc = (c.get("description") or "").lower()
+        score = 0.0
+        for kw in keywords:
+            kw_l = kw.lower()
+            score += title.count(kw_l) * 6
+            score += desc.count(kw_l) * 4
+            score += text.count(kw_l) * 1
+        if score <= 0:
+            continue
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        existing = per_video.get(vid)
+        payload = {**c, "_channel_label": channel_label, "_score": score / 10.0}
+        if existing is None or score > existing[0]:
+            per_video[vid] = (score, payload)
+    hits = sorted(per_video.values(), key=lambda x: -x[0])
     return [h[1] for h in hits[:limit]]
 
 
@@ -458,6 +473,8 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    _warm_embedder()
 
     with st.sidebar:
         enabled = _sidebar()

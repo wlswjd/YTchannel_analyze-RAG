@@ -76,9 +76,13 @@ def get_video_details(video_ids):
                 {
                     "video_id": video_id,
                     "title": snippet.get("title", ""),
+                    "description": snippet.get("description", ""),
+                    "tags": snippet.get("tags", []),
+                    "channel_title": snippet.get("channelTitle", ""),
                     "published_at": snippet.get("publishedAt", ""),
                     "view_count": int(statistics.get("viewCount", 0)),
                     "like_count": int(statistics.get("likeCount", 0)),
+                    "comment_count": int(statistics.get("commentCount", 0)),
                     "duration_sec": duration_sec,
                     "thumbnail_url": thumbnail_url,
                     "video_url": f"https://www.youtube.com/watch?v={video_id}",

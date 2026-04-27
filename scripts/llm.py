@@ -165,7 +165,7 @@ episode_search: 특정 에피소드·장면 찾기
 def generate_episode_answer(query: str, candidates: list[dict]) -> str:
     if not candidates:
         return (
-            f"「{query}」와 관련된 자막을 찾지 못했어요.\n\n"
+            f"「{query}」와 관련된 영상을 찾지 못했어요.\n\n"
             "혹시 기억나는 **출연자 이름**, **장소**, **음식이나 소품**, **대사 키워드** 중 "
             "하나만 더 알려주시면 다시 찾아볼게요."
         )
@@ -173,7 +173,6 @@ def generate_episode_answer(query: str, candidates: list[dict]) -> str:
     if not llm_available():
         return _fallback_episode(query, candidates)
 
-    # 중복 영상 제거 (video_id 기준)
     seen_ids: set[str] = set()
     unique_candidates: list[dict] = []
     for c in candidates:
@@ -190,29 +189,57 @@ def generate_episode_answer(query: str, candidates: list[dict]) -> str:
         title = (c.get("title") or "")[:120]
         url = c.get("video_url") or ""
         pub = (c.get("published_at") or "")[:10]
-        excerpt = (c.get("text") or "")[:250].replace("\n", " ").strip()
-        meta = f"   업로드: {pub}" if pub else ""
-        lines.append(f"{i}. 제목: {title}\n   링크: {url}{meta}\n   자막: {excerpt}")
+        desc = (c.get("description") or "")[:400].replace("\n", " ").strip()
+        snippets = c.get("_snippets") or []
+        if snippets:
+            excerpt = " / ".join(s.replace("\n", " ").strip() for s in snippets[:2])[:500]
+        else:
+            excerpt = (c.get("text") or "")[:300].replace("\n", " ").strip()
+        score = c.get("_score")
+        score_str = f" (관련도 {score:.2f})" if isinstance(score, (int, float)) else ""
+        meta_line = f"   업로드: {pub}" if pub else ""
+        lines.append(
+            f"{i}. 제목: {title}{score_str}\n"
+            f"   링크: {url}\n"
+            f"{meta_line}\n"
+            f"   영상 설명: {desc if desc else '(없음)'}\n"
+            f"   자막 발췌: {excerpt if excerpt else '(자막 매치 없음)'}"
+        )
     cand_text = "\n\n".join(lines)
 
     if n == 1:
         answer_guide = (
-            "- 해당 영상이 맞는지 자막 근거 1~2문장으로 설명\n"
-            "- 확신이 낮으면 솔직히 밝혀줘"
+            "후보가 1개뿐이야. 아래 형식으로 답해줘:\n"
+            "1) 첫 줄: '찾으시는 영상은 **[제목](링크)** 인 것 같아요.'\n"
+            "2) 다음 단락: 이 영상이 어떤 내용인지 영상 설명·자막 근거로 2~3문장 자연스럽게 소개\n"
+            "3) 마지막 줄: 업로드 날짜 한 줄 (있으면)"
         )
     else:
         answer_guide = (
-            f"- 후보가 {n}개야. 각 영상이 어떤 내용인지 1줄씩 간략히 소개해줘\n"
-            "- 그 중 질문과 가장 관련 있는 영상을 명확히 추천하고, 이유를 자막 근거로 1~2문장 설명\n"
-            "- 확신이 낮으면 솔직히 밝히고 상위 2~3개를 후보로 제시"
+            f"후보가 {n}개야. 점수가 가장 높은 1번이 정답일 가능성이 가장 높아.\n"
+            "아래 형식으로 답해줘:\n"
+            "1) 첫 줄: '찾으시는 영상은 **[1번 제목](1번 링크)** 인 것 같아요.'\n"
+            "2) 다음 단락: 이 영상이 어떤 내용인지 영상 설명·자막 근거로 2~3문장 자연스럽게 소개\n"
+            "3) '혹시 이 영상이 아니라면, 아래 후보도 확인해보세요:' 라고 적고\n"
+            "   2번부터 4번까지를 마크다운 리스트로 (번호 없이) '- [제목](링크) — 1줄 요약' 형태로 제시\n"
+            "4) 단, 1번의 점수가 명백히 낮거나 질문과 동떨어져 보이면 솔직히 '정확히 일치하는 영상은 못 찾았는데, 비슷한 후보로는…'이라고 밝혀도 돼"
         )
 
-    prompt = f"""너는 유튜브 채널 자막 기반으로 특정 영상을 찾아주는 도우미야.
+    prompt = f"""너는 유튜브 채널 영상을 찾아주는 도우미야.
+사용자 질문에 가장 잘 맞는 영상을 추천하는 게 임무야.
 
-공통 규칙:
-- 한국어로, 친근하고 간결하게
-- 링크는 반드시 마크다운 형식 [제목](링크) 으로 포함
+판단 자료:
+- 영상 제목 (가장 신뢰도 높음)
+- 영상 설명(description) — 출연자/회차/줄거리/해시태그가 들어있는 핵심 정보
+- 자막 발췌 — 실제 대사. 사람 이름은 잘못 들리거나 다르게 적힐 수 있음
+- 관련도 점수 — 0~1.2 사이, 높을수록 의미상 가까움
+
+원칙:
+- 한국어, 친근하고 간결하게
+- 링크는 반드시 [제목](링크) 마크다운으로
 - 후보에 없는 영상은 절대 지어내지 마
+- 출연자 이름은 자막의 음차 표기보다 영상 설명·태그를 우선시해
+
 {answer_guide}
 
 질문: {query}
@@ -228,7 +255,6 @@ def _fallback_episode(query: str, candidates: list[dict]) -> str:
     if not candidates:
         return "관련 영상을 찾지 못했어요. 다른 키워드로 다시 시도해보세요."
 
-    # 중복 제거
     seen_ids: set[str] = set()
     unique: list[dict] = []
     for c in candidates:
@@ -237,27 +263,27 @@ def _fallback_episode(query: str, candidates: list[dict]) -> str:
             seen_ids.add(vid)
             unique.append(c)
 
-    if len(unique) == 1:
-        top = unique[0]
-        title = top.get("title", "")
-        url = top.get("video_url", "")
-        excerpt = (top.get("text") or "")[:250]
-        return (
-            f"이 영상일 가능성이 높아요.\n\n"
-            f"**[{title}]({url})**\n\n"
-            f"> {excerpt}\n\n"
-            "출연자 이름, 장소, 음식, 대사 키워드를 더 알려주시면 더 정확히 찾아볼게요."
-        )
+    top = unique[0]
+    title = top.get("title", "")
+    url = top.get("video_url", "")
+    desc = (top.get("description") or "")[:200]
 
-    lines = ["관련 후보 영상이 여러 개 찾아졌어요. 아래 중 해당하는 영상이 있는지 확인해보세요!\n"]
-    for i, c in enumerate(unique[:5], 1):
-        title = c.get("title", "")
-        url = c.get("video_url", "")
+    head = f"찾으시는 영상은 **[{title}]({url})** 인 것 같아요."
+    body = f"\n\n> {desc}" if desc else ""
+
+    if len(unique) == 1:
+        return head + body
+
+    others = []
+    for c in unique[1:5]:
+        t = c.get("title", "")
+        u = c.get("video_url", "")
         pub = (c.get("published_at") or "")[:10]
         date_str = f" ({pub})" if pub else ""
-        lines.append(f"{i}. **[{title}]({url})**{date_str}")
-    lines.append("\n출연자 이름, 장소, 음식, 대사 키워드를 더 알려주시면 더 정확히 찾아볼게요.")
-    return "\n".join(lines)
+        others.append(f"- [{t}]({u}){date_str}")
+
+    tail = "\n\n혹시 이 영상이 아니라면, 아래 후보도 확인해보세요:\n" + "\n".join(others)
+    return head + body + tail
 
 
 # ── 채널 분석 요약 ─────────────────────────────────────────────
