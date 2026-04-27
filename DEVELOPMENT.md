@@ -2,7 +2,7 @@
 
 ## 1. 프로젝트 한 줄 요약
 
-특정 유튜브 채널(뜬뜬·쑥쑥·15야)의 영상을 수집하고, RAG(검색 + LLM)로
+특정 유튜브 채널(뜬뜬·쑥쑥·채널십오야)의 영상을 수집하고, RAG(검색 + LLM)로
 **"그 ○○○이랑 △△ 먹던 편 뭐였지?"** 같은 자연어 질문에 답해주는 Streamlit 봇.
 
 ## 2. 현재 데이터 파이프라인
@@ -46,7 +46,8 @@ app.py (Streamlit)       ── 의미검색 → 영상 단위 점수 집계 →
 | 5 | ChromaDB 도입, 한국어 임베딩 모델로 의미 검색 | `vector_store.py`, `build_vector_db.py` |
 | 6 | 채널 분석(통계 + Plotly 차트 + Gemini 인사이트) | `app.py: compute_analytics`, `llm.py: generate_analytics_summary` |
 | 7 | Intent 라우팅(분석 vs 에피소드 검색) + 날짜·채널 추출 | `llm.py: detect_intent` |
-| **8 (이번 개선)** | **description/tags 수집·메타 청크 도입·점수 집계 개선·LLM 프롬프트 개선** | `enrich_metadata.py` 신규 외 다수 |
+| 8 | description/tags 수집·메타 청크 도입·점수 집계 개선·LLM 프롬프트 개선 | `enrich_metadata.py` 신규 외 다수 |
+| **9 (이번 후속 개선)** | **Gemini thinking 토큰 이슈 수정·후보 UI 정리·분석 도넛 차트·사이드바 보강·채널 라벨 표준화** | `app.py`, `llm.py`, `channels.py` |
 
 ## 4. 이번 개선(2026-04-27)에서 해결한 문제
 
@@ -83,6 +84,63 @@ app.py (Streamlit)       ── 의미검색 → 영상 단위 점수 집계 →
 - `snippet.description`, `snippet.tags`, `snippet.channelTitle`,
   `statistics.commentCount` 모두 수집
 - 기존 데이터를 다시 긁지 않아도 되도록 `enrich_metadata.py` 별도 제공
+
+## 4-1. 후속 개선(2026-04-27 오후)에서 해결한 문제
+
+### 문제 4 — Gemini 답변이 링크 한복판에서 잘려서 끝남
+
+**증상**
+- "찾으시는 영상은 **[[EN] 100분 토크는 핑계고 | EP.100](https://www.youtube.com/watch?v=7j_Oc"
+  처럼 마크다운 링크가 닫히지도 못한 채 잘림.
+
+**원인**
+- 사용 중인 모델(`gemini-flash-latest` = 2.5-flash 계열)은 **reasoning(thinking) 모델**.
+- `max_output_tokens` 한도 안에 thinking 토큰이 같이 잡힘.
+- `max_output_tokens=1200` 인데 thinking에서 1100토큰을 먹어 버리면 실제 출력이 100토큰만
+  남아 링크 중간에 끊기는 현상이 발생.
+
+**해결** (`scripts/llm.py`)
+- `thinking_config=ThinkingConfig(thinking_budget=0)` 으로 thinking 비활성화 시도
+  (구버전 SDK라 지원 안 되면 자동 fallback).
+- `max_output_tokens` 기본값을 `600 → 2000`, 에피소드 답변용 호출도 `1200 → 2000`.
+- `finish_reason == MAX_TOKENS` 인데 응답이 비었으면 한 번 더 3배 한도로 재시도.
+- 응답이 비거나 너무 짧으면(20자 미만) 룰 기반 `_fallback_episode` 답변으로 대체.
+
+### 문제 5 — 답변 아래 후보 영상 5개가 그대로 깔려 화면이 산만함
+
+**증상**
+- LLM이 본문에서 1번 영상을 추천하고 있는데, 그 1번이 카드 리스트에도 또 들어가서
+  사용자 시선이 분산됨.
+
+**해결** (`scripts/app.py: _render_episode_candidates`)
+- 1번(가장 점수 높은 영상)은 답변 본문에 이미 있으므로 카드 리스트에서 **제외**.
+- 나머지 2~5번은 **`다른 후보 영상 N개 보기` expander**(접힘) 안에 넣어 답변에 집중.
+
+### 문제 6 — 분석 모드에 그래프가 3개뿐, 인사이트성 차트 부족
+
+**해결** (`scripts/app.py`)
+- `compute_analytics`에 **조회수 구간 분포**(`view_distribution`) + **TOP10 점유율**
+  (`top10_share`) 통계 추가.
+- 분석 화면 좌측 차트 영역 맨 아래에 **도넛 차트** 추가.
+  - 4구간(1000만+ / 100만~1000만 / 10만~100만 / 10만 미만) 색상 분리
+  - 도넛 가운데 총 영상 수 표시
+  - 차트 아래 "TOP 10 영상이 전체 조회수의 X%를 차지" 캡션으로 콘텐츠 의존도 정보 보강.
+
+### 문제 7 — 사이드바가 채널 체크박스 3개뿐, 실제 사이트 느낌 부족
+
+**해결** (`scripts/app.py: _sidebar`)
+- **데이터 현황 카드**: 선택된 채널마다 영상 수·총 조회수·업로드 기간을 5분 캐시로 표시.
+- **예시 질문 버튼 4개**: 클릭하면 `st.session_state["queued_query"]`에 담아
+  `st.rerun()` → 채팅 입력 흐름 그대로 자동 처리.
+- **🗑️ 대화 초기화** 버튼: 메시지 히스토리 비움.
+- **푸터 캡션**: "Powered by Gemini · ChromaDB · Streamlit".
+
+### 문제 8 — 채널 라벨 "15야"가 정식 명칭과 안 맞음
+
+**해결**
+- `channels.py` 라벨을 `15야` → `채널십오야`.
+- `llm.py`의 의도 분석 매핑(`_CHANNEL_MAP`)과 프롬프트 표기를 함께 갱신해서
+  `채널십오야`/`십오야`/`15야` 어떤 표기로 질문해도 동일 채널로 인식.
 
 ## 5. 검색 정확도 검증 (이번 개선 후)
 
@@ -190,7 +248,7 @@ YTchannel_analyze RAG/
   좀 더. 채널 전체 재수집은 quota 거의 다 씀.
 - **자막 추출 IP 차단**: `youtube_transcript_api` 가 IP rate limit 걸리면 빈 transcript로
   떨어짐 → `transcript_rescrape.py`로 yt-dlp 백업.
-- **15야 채널은 자막 거의 없음** — 메타 청크 위주로만 검색 가능. 정상 동작 중.
+- **채널십오야 채널은 자막 거의 없음** — 메타 청크 위주로만 검색 가능. 정상 동작 중.
 - **HuggingFace 모델 첫 로드는 인터넷 필요** — `.hf_cache/` 가 비어있으면 첫 실행 시
   ~500MB 다운로드. 이후엔 오프라인도 가능 (`HF_HUB_OFFLINE=1`).
 - **Streamlit hot-reload 한계** — 모듈 import 변경 후엔 streamlit 재시작 필요.
