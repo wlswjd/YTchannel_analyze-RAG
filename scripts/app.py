@@ -5,6 +5,8 @@
 
 실행:
   streamlit run scripts/app.py
+
+추후 다른 카테고리 사이드바나 기타 간단한 기능들 추가 예정
 """
 from __future__ import annotations
 
