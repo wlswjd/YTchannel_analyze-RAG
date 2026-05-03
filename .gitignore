@@ -26,13 +26,15 @@ env/
 
 # ---- Project outputs / large artifacts ----
 *.jsonl
+!data/processed/*.jsonl
 *.log
 
-# Dataset / raw exports (keep out of git; use a separate storage)
-*_raw_data.json
+# Dataset / raw exports
+# - data/raw/*_raw_data.json: tracked in normal git (~20MB)
+# - data/processed/*.jsonl: tracked in normal git (~33MB)
+# - chroma_db/: tracked via Git LFS (see .gitattributes, ~243MB)
+# Local caches stay ignored.
 ddeunddeun_raw_data_with_transcripts.json
-data/processed/
-chroma_db/
 .hf_cache/
 
 # Temporary subtitle downloads / caches
