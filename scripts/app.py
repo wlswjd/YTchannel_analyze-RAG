@@ -26,7 +26,8 @@ from llm import (  # noqa: E402
     generate_episode_answer,
     llm_available,
 )
-from vector_store import get_embedder, semantic_search  # noqa: E402
+from hybrid_search import hybrid_search  # noqa: E402
+from vector_store import get_embedder  # noqa: E402
 
 
 @st.cache_resource(show_spinner="검색 모델 로드 중...")
@@ -92,9 +93,9 @@ def run_episode_search(query: str, enabled: list[dict], n: int = 8) -> list[dict
     """의미 검색 시도 → 실패 시 키워드 검색 fallback."""
     channel_ids = [ch["id"] for ch in enabled]
 
-    # 1차: 의미 검색 (ChromaDB)
+    # 1차: Hybrid 검색 (Dense + BM25 RRF; BM25 인덱스 없으면 Dense 전용 자동 폴백)
     try:
-        results = semantic_search(channel_ids=channel_ids, query=query, n_results=n)
+        results = hybrid_search(channel_ids=channel_ids, query=query, n_results=n)
         if results:
             return results
     except Exception:

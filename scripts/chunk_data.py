@@ -10,10 +10,26 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import data_processed_dir  # noqa: E402
+
+
+def _parse_upload_date(published_at: str) -> int:
+    """published_at 문자열을 YYYYMMDD 정수로 변환. 파싱 실패 시 0."""
+    if not published_at:
+        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y%m%d"):
+        try:
+            return int(datetime.strptime(published_at[:len(fmt)], fmt).strftime("%Y%m%d"))
+        except ValueError:
+            continue
+    digits = re.sub(r"\D", "", published_at)
+    if len(digits) >= 8:
+        return int(digits[:8])
+    return 0
 
 
 def _ep_from_title(title: str) -> str | None:
@@ -111,11 +127,13 @@ def main():
             vid = row.get("video_id", "")
             title = row.get("title", "")
             ep = _ep_from_title(title)
+            published_at = row.get("published_at", "")
             base_meta = {
                 "video_id": vid,
                 "title": title,
                 "episode_hint": ep,
-                "published_at": row.get("published_at", ""),
+                "published_at": published_at,
+                "upload_date": _parse_upload_date(published_at),
                 "video_url": row.get("video_url", ""),
                 "view_count": row.get("view_count", 0),
                 "like_count": row.get("like_count", 0),
@@ -129,7 +147,7 @@ def main():
                     **base_meta,
                     "chunk_id": f"{vid}_meta",
                     "chunk_index": -1,
-                    "chunk_kind": "meta",
+                    "chunk_type": "metadata",
                     "text": meta_text,
                 }
                 f.write(json.dumps(doc, ensure_ascii=False) + "\n")
@@ -143,7 +161,7 @@ def main():
                         **base_meta,
                         "chunk_id": f"{vid}_{idx}",
                         "chunk_index": idx,
-                        "chunk_kind": "transcript",
+                        "chunk_type": "transcript",
                         "text": part,
                     }
                     f.write(json.dumps(doc, ensure_ascii=False) + "\n")

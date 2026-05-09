@@ -137,7 +137,14 @@ def upsert_chunks_jsonl(
 
     col = client.get_or_create_collection(
         name=name,
-        metadata={"hnsw:space": "cosine", "model": model_name, "channel": channel_id},
+        metadata={
+            "hnsw:space": "cosine",
+            "hnsw:M": 16,
+            "hnsw:construction_ef": 100,
+            "hnsw:search_ef": 30,
+            "model": model_name,
+            "channel": channel_id,
+        },
     )
 
     embedder = get_embedder(model_name)
@@ -154,7 +161,11 @@ def upsert_chunks_jsonl(
         if not text:
             continue
 
-        chunk_kind = row.get("chunk_kind") or ("meta" if row.get("chunk_index", 0) == -1 else "transcript")
+        # 신규 chunk_type 우선, 구 chunk_kind 폴백
+        chunk_type = row.get("chunk_type") or (
+            "metadata" if row.get("chunk_kind") == "meta" or row.get("chunk_index", 0) == -1
+            else "transcript"
+        )
 
         ids.append(str(row.get("chunk_id") or f"{row.get('video_id','')}_{row.get('chunk_index',0)}"))
         docs.append(text)
@@ -170,15 +181,16 @@ def upsert_chunks_jsonl(
                 "description": str(row.get("description") or "")[:1500],
                 "episode_hint": str(episode_hint),
                 "published_at": str(row.get("published_at") or ""),
+                "upload_date": int(row.get("upload_date") or 0),
                 "video_url": str(row.get("video_url") or ""),
                 "view_count": int(row.get("view_count") or 0),
                 "duration_sec": int(row.get("duration_sec") or 0),
-                "chunk_kind": chunk_kind,
+                "chunk_type": chunk_type,
                 "chunk_index": int(row.get("chunk_index") or 0),
             }
         )
 
-        if chunk_kind == "meta":
+        if chunk_type == "metadata":
             meta_count += 1
         else:
             transcript_count += 1
@@ -249,8 +261,9 @@ def semantic_search(
         for _id, doc, meta, dist in zip(ids, docs, metas, dists):
             meta = meta or {}
             score = 1.0 - float(dist)
-            kind = meta.get("chunk_kind") or "transcript"
-            if kind == "meta":
+            # 신규 chunk_type 우선, 구 chunk_kind 폴백
+            kind = meta.get("chunk_type") or meta.get("chunk_kind") or "transcript"
+            if kind in ("metadata", "meta"):
                 score += META_CHUNK_BOOST
 
             vid = str(meta.get("video_id") or _id.split("_")[0])
