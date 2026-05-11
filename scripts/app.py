@@ -11,12 +11,23 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+# Streamlit Cloud는 .env가 없고 secrets로만 키를 받음.
+# llm.py가 os.getenv(...)로 키를 읽으므로, st.secrets 값을 환경변수에 미리 주입.
+# (로컬에서는 secrets 파일이 없어도 조용히 패스 → .env가 그대로 사용됨)
+try:
+    for _k in ("GEMINI_API_KEY", "GEMINI_MODEL"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = str(st.secrets[_k])
+except Exception:
+    pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from channels import CHANNELS, chunks_path, raw_path  # noqa: E402
