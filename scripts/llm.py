@@ -77,6 +77,17 @@ def _call(prompt: str, max_tokens: int = 2000) -> str | None:
 
 _ANALYTICS_KEYWORDS = ["분석", "통계", "트렌드", "업로드", "조회수 추이", "몇 편", "기간", "현황"]
 
+# 인물·콘텐츠·채널이 "무엇/누구"인지 묻는 정보 질문 신호
+_CONCEPT_QA_KEYWORDS = [
+    "뭐야", "뭐임", "뭐지", "뭐예요", "뭐인가요", "뭐인가",
+    "누구야", "누구임", "누구지", "누구예요", "누구인가",
+    "어떤 채널", "어떤 콘텐츠", "어떤 프로그램", "어떤 방송",
+    "설명해", "알려줘",
+]
+
+# concept_qa 키워드가 잡혀도 회차/에피소드 검색 의도가 분명하면 episode_search로 폴백
+_EPISODE_OVERRIDE_KEYWORDS = ["회차", "에피소드", "ep.", "ep ", "몇 회"]
+
 _CHANNEL_MAP: dict[str, str] = {
     "뜬뜬": "ddeunddeun",
     "핑계고": "ddeunddeun",
@@ -89,7 +100,15 @@ _CHANNEL_MAP: dict[str, str] = {
 
 
 def _rule_intent(query: str) -> str:
-    return "analytics" if any(kw in query for kw in _ANALYTICS_KEYWORDS) else "episode_search"
+    q = query.lower()
+    if any(kw in query for kw in _ANALYTICS_KEYWORDS):
+        return "analytics"
+    if any(kw in query for kw in _CONCEPT_QA_KEYWORDS):
+        # "회차 알려줘" / "EP.78 알려줘" 등은 영상 찾기로 폴백
+        if any(kw in q for kw in _EPISODE_OVERRIDE_KEYWORDS):
+            return "episode_search"
+        return "concept_qa"
+    return "episode_search"
 
 
 def _rule_dates(query: str) -> dict:
@@ -139,7 +158,7 @@ def detect_intent(query: str, available_channel_labels: list[str]) -> dict:
 
     Returns:
         {
-            "intent": "episode_search" | "analytics",
+            "intent": "episode_search" | "concept_qa" | "analytics",
             "channel_ids": ["ddeunddeun", ...] | None,
             "date_from": "YYYY-MM" | None,
             "date_to":   "YYYY-MM" | None,
@@ -158,21 +177,26 @@ def detect_intent(query: str, available_channel_labels: list[str]) -> dict:
         return result
 
     # LLM 보정 (실패해도 룰 기반 결과 유지)
-    channels_str = ", ".join(available_channel_labels)
     prompt = f"""사용자 질문을 분석해서 JSON만 반환해. 설명 없이 JSON 딱 하나만.
 
 채널 이름 → id: 뜬뜬→ddeunddeun, 쑥쑥→ssookssook, 채널십오야(=십오야,15야)→channel15ya
 현재 연도: 2026년
 
 {{
-  "intent": "episode_search" 또는 "analytics",
+  "intent": "episode_search" | "concept_qa" | "analytics",
   "channel_ids": ["id"] 또는 null,
   "date_from": "YYYY-MM" 또는 null,
   "date_to": "YYYY-MM" 또는 null
 }}
 
-analytics: 분석/통계/트렌드/몇 편/기간 조회
-episode_search: 특정 에피소드·장면 찾기
+intent 분류 기준:
+- analytics: 분석/통계/트렌드/몇 편/기간/조회수 추이 등 수치 기반 질문
+  예) "뜬뜬 25년 1월부터 분석해줘", "월별 업로드 수 알려줘"
+- concept_qa: 인물·콘텐츠·채널이 "무엇/누구"인지 묻는 정보·설명 질문
+  (특정 영상 한 편을 찾는 게 아니라, 검색된 영상들의 정보를 종합해 답해야 함)
+  예) "풍향고가 뭐야?", "유재석이 누구야?", "유재석이 진행하는 채널은?"
+- episode_search: 특정 에피소드·장면·회차를 찾아달라는 질문
+  예) "이서진이랑 떡국 끓여먹던 편이 뭐였지?", "박보검 나온 핑계고 회차"
 
 질문: {query}"""
 
@@ -188,6 +212,10 @@ episode_search: 특정 에피소드·장면 찾기
                         result[k] = llm_result[k]
             except Exception:
                 pass
+
+    # intent 화이트리스트 강제
+    if result.get("intent") not in {"episode_search", "concept_qa", "analytics"}:
+        result["intent"] = "episode_search"
 
     return result
 
@@ -318,6 +346,143 @@ def _fallback_episode(query: str, candidates: list[dict]) -> str:
 
     tail = "\n\n혹시 이 영상이 아니라면, 아래 후보도 확인해보세요:\n" + "\n".join(others)
     return head + body + tail
+
+
+# ── 개념/인물 설명 답변 (concept_qa) ───────────────────────────
+
+def generate_concept_answer(query: str, candidates: list[dict]) -> str:
+    """
+    "풍향고가 뭐야?", "유재석이 누구?" 같은 개념·인물 질문에 대해
+    검색된 영상들의 정보(제목/설명/태그)를 종합해 풀어서 답변.
+
+    episode_search와 달리 영상 한 편을 찾는 게 아니라,
+    후보들의 메타데이터를 종합해 자연스러운 설명을 만든 뒤
+    본문 맨 아래에 '관련 영상' 1~2개를 마크다운 링크로 첨부.
+    """
+    if not candidates:
+        return (
+            f"「{query}」 관련 정보를 찾지 못했어요.\n\n"
+            "조금 더 구체적인 키워드(인물 이름, 콘텐츠 이름, 채널 등)로 다시 물어봐 주세요."
+        )
+
+    if not llm_available():
+        return _fallback_concept(query, candidates)
+
+    seen_ids: set[str] = set()
+    unique_candidates: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid not in seen_ids:
+            seen_ids.add(vid)
+            unique_candidates.append(c)
+
+    # 개념 질문은 종합이 핵심 — 후보를 episode_search보다 많이 보여줌
+    top = unique_candidates[:8]
+
+    lines = []
+    for i, c in enumerate(top, 1):
+        title = (c.get("title") or "")[:140]
+        url = c.get("video_url") or ""
+        pub = (c.get("published_at") or "")[:10]
+        desc = (c.get("description") or "")[:600].replace("\n", " ").strip()
+        tags_raw = c.get("tags") or []
+        if isinstance(tags_raw, list):
+            tags_text = ", ".join(str(t) for t in tags_raw[:20])
+        else:
+            tags_text = str(tags_raw)[:300]
+        snippets = c.get("_snippets") or []
+        if snippets:
+            excerpt = " / ".join(s.replace("\n", " ").strip() for s in snippets[:2])[:400]
+        else:
+            excerpt = (c.get("text") or "")[:250].replace("\n", " ").strip()
+        channel = c.get("_channel_label") or c.get("channel_label", "")
+        score = c.get("_score")
+        score_str = f" (관련도 {score:.2f})" if isinstance(score, (int, float)) else ""
+
+        lines.append(
+            f"{i}. 제목: {title}{score_str}\n"
+            f"   채널: {channel if channel else '(미상)'}\n"
+            f"   링크: {url}\n"
+            f"   업로드: {pub if pub else '(미상)'}\n"
+            f"   영상 설명: {desc if desc else '(없음)'}\n"
+            f"   태그: {tags_text if tags_text else '(없음)'}\n"
+            f"   자막 발췌: {excerpt if excerpt else '(없음)'}"
+        )
+    cand_text = "\n\n".join(lines)
+
+    prompt = f"""너는 유튜브 채널 콘텐츠 정보를 정리해 알려주는 도우미야.
+사용자의 질문은 영상 한 편을 찾아달라는 게 아니라,
+**인물·콘텐츠·채널이 "무엇/누구"인지** 설명해달라는 질문이야.
+
+판단 자료(중요도 순):
+- 영상 제목 — 콘텐츠 명칭과 회차가 가장 정확하게 드러남
+- 영상 설명(description) — 출연자/줄거리/콘셉트/해시태그 등 핵심 정보
+- 태그 — 콘텐츠 키워드 (출연자·시리즈명 보완)
+- 자막 발췌 — 실제 대사. 사람 이름은 음차/오타 가능성 있음
+- 관련도 점수 — 0~1.2, 높을수록 의미상 가까움
+
+답변 작성 원칙:
+1. **종합**해서 답해. 후보들의 제목·설명·태그를 묶어 콘텐츠의 정체/콘셉트/출연자/시즌을 풀어 설명.
+   (한 영상만 콕 집어 "이 영상이에요" 식의 답은 금지)
+2. 한국어로 2~5문장. 친근하고 자연스럽게.
+3. 핵심 정보(콘텐츠 이름, 채널, 출연자, 콘셉트/포맷, 시즌·시리즈 구분)는 가능한 한 빠뜨리지 마.
+4. 검색 결과에 **없는 내용은 절대 지어내지 마**. 정보가 부족하면 "정확히는 확인이 어렵다"고 솔직히 밝혀.
+5. 자막 음차보다 영상 설명·태그를 우선시해 (예: 자막의 "보검이" → 설명의 "박보검").
+6. 본문 끝에 빈 줄을 두고 다음 형식으로 가장 관련 높은 영상 1~2개를 첨부:
+   ```
+   **관련 영상**
+   - [영상 제목](영상 링크)
+   - [영상 제목](영상 링크)
+   ```
+   (후보에 없는 영상은 절대 만들지 말 것)
+
+질문: {query}
+
+검색 후보:
+{cand_text}"""
+
+    result = _call(prompt, max_tokens=2000)
+    if result and len(result.strip()) >= 30:
+        return result
+    return _fallback_concept(query, unique_candidates)
+
+
+def _fallback_concept(query: str, candidates: list[dict]) -> str:
+    if not candidates:
+        return "관련 정보를 찾지 못했어요. 다른 키워드로 다시 시도해 주세요."
+
+    seen_ids: set[str] = set()
+    unique: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid not in seen_ids:
+            seen_ids.add(vid)
+            unique.append(c)
+
+    head = f"「{query}」 관련 영상에서 찾은 정보를 정리했어요.\n\n"
+
+    bullets: list[str] = []
+    for c in unique[:3]:
+        title = c.get("title") or ""
+        desc = (c.get("description") or "")[:180].replace("\n", " ").strip()
+        if title and desc:
+            bullets.append(f"- **{title}** — {desc}…")
+        elif title:
+            bullets.append(f"- **{title}**")
+
+    body = "\n".join(bullets) if bullets else "_(영상 설명을 가져오지 못했어요.)_"
+
+    related_lines = []
+    for c in unique[:2]:
+        t = c.get("title", "")
+        u = c.get("video_url", "")
+        if t and u:
+            related_lines.append(f"- [{t}]({u})")
+    related = ""
+    if related_lines:
+        related = "\n\n**관련 영상**\n" + "\n".join(related_lines)
+
+    return head + body + related
 
 
 # ── 채널 분석 요약 ─────────────────────────────────────────────

@@ -23,6 +23,7 @@ from channels import CHANNELS, chunks_path, raw_path  # noqa: E402
 from llm import (  # noqa: E402
     detect_intent,
     generate_analytics_summary,
+    generate_concept_answer,
     generate_episode_answer,
     llm_available,
 )
@@ -430,6 +431,42 @@ def _render_analytics(msg: dict) -> None:
             st.caption(f"{top['views']:,}회")
 
 
+def _render_concept_candidates(candidates: list[dict]) -> None:
+    """concept_qa 답변에는 본문에 이미 '관련 영상' 1~2개가 포함되므로,
+    더 보고 싶은 사용자를 위해 추가 후보 영상을 expander에 담아 제공."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for c in candidates:
+        vid = c.get("video_id") or c.get("chunk_id", "")
+        if vid in seen:
+            continue
+        seen.add(vid)
+        unique.append(c)
+
+    # 본문에 이미 1~2개가 노출되므로 그 다음부터 보여줌
+    extras = unique[2:7]
+    if not extras:
+        return
+
+    with st.expander(f"관련 영상 더 보기 ({len(extras)}개)"):
+        for c in extras:
+            title = c.get("title", "")
+            url = c.get("video_url") or c.get("url", "")
+            views = _fmt_views(c.get("view_count") or 0)
+            pub = (c.get("published_at") or "")[:10]
+            dur = _fmt_duration(c.get("duration_sec") or 0)
+            channel = c.get("_channel_label") or c.get("channel_label", "")
+
+            col_title, col_ch, col_views, col_date, col_dur = st.columns(
+                [4, 1.2, 1.2, 1.5, 1]
+            )
+            col_title.markdown(f"[{title}]({url})" if url else title)
+            col_ch.caption(channel)
+            col_views.caption(f"👁 {views}")
+            col_date.caption(pub)
+            col_dur.caption(dur)
+
+
 def _render_message(msg: dict) -> None:
     with st.chat_message(msg["role"]):
         if msg.get("type") == "analytics":
@@ -438,6 +475,10 @@ def _render_message(msg: dict) -> None:
             st.markdown(msg.get("content", ""))
             if msg.get("candidates"):
                 _render_episode_candidates(msg["candidates"])
+        elif msg.get("type") == "concept":
+            st.markdown(msg.get("content", ""))
+            if msg.get("candidates"):
+                _render_concept_candidates(msg["candidates"])
         else:
             st.markdown(msg.get("content", ""))
 
@@ -510,6 +551,18 @@ def handle_query(query: str, enabled: list[dict]) -> dict:
             "summary": summary,
         }
 
+    # ── 개념·인물 질문 (concept_qa) ──
+    if intent == "concept_qa":
+        # 종합 답변을 만들려면 후보를 좀 더 넉넉히 가져옴
+        results = run_episode_search(query, target, n=10)
+        answer = generate_concept_answer(query, results)
+        return {
+            "role": "assistant",
+            "type": "concept",
+            "content": answer,
+            "candidates": results,
+        }
+
     # ── 에피소드 검색 ──
     results = run_episode_search(query, target, n=8)
     answer = generate_episode_answer(query, results)
@@ -526,6 +579,8 @@ def handle_query(query: str, enabled: list[dict]) -> dict:
 _EXAMPLE_QUERIES = [
     "이서진이랑 떡국 끓여먹던 편이 뭐였지?",
     "윤경호 나와서 썰푸는 편이 어떤 편이었지?",
+    "풍향고가 뭐야?",
+    "유재석이 진행하는 채널은?",
     "뜬뜬 채널 25년 4월부터 26년 4월까지 분석해줘",
     "쑥쑥 채널 처음 만들어졌을때부터 지금까지 분석해줘",
 ]
@@ -654,6 +709,8 @@ def main() -> None:
                     "안녕하세요! 유튜브 채널 봇입니다.\n\n"
                     "**에피소드 검색** — 기억이 가물가물한 편을 찾아드려요\n"
                     "> 예: *이서진이랑 떡국 끓여먹던 편이 뭐였지?*\n\n"
+                    "**콘텐츠·인물 설명** — \"뭐야?\", \"누구야?\" 질문을 종합 답변으로\n"
+                    "> 예: *풍향고가 뭐야?*, *유재석이 진행하는 채널은?*\n\n"
                     "**채널 분석** — 기간별 통계와 AI 인사이트를 보여드려요\n"
                     "> 예: *뜬뜬 채널 25년 4월부터 26년 4월까지 분석해줘*\n\n"
                     "왼쪽에서 검색할 채널을 선택해 주세요."
@@ -687,6 +744,10 @@ def main() -> None:
                 st.markdown(response.get("content", ""))
                 if response.get("candidates"):
                     _render_episode_candidates(response["candidates"])
+            elif response.get("type") == "concept":
+                st.markdown(response.get("content", ""))
+                if response.get("candidates"):
+                    _render_concept_candidates(response["candidates"])
             else:
                 st.markdown(response.get("content", ""))
 
