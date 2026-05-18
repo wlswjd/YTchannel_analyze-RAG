@@ -23,6 +23,7 @@ from rank_bm25 import BM25Okapi
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import ROOT  # noqa: E402
+from reranker import rerank as _rerank  # noqa: E402
 from vector_store import (  # noqa: E402
     DEFAULT_MODEL,
     META_CHUNK_BOOST,
@@ -34,7 +35,8 @@ from vector_store import (  # noqa: E402
 
 BM25_DIR = ROOT / "data" / "bm25"
 RRF_K = 60
-TOP_N = 30  # Dense / BM25 각각에서 가져올 청크 수
+TOP_N = 30          # Dense / BM25 각각에서 가져올 청크 수
+RERANK_CANDIDATES = 20  # video_id 집계 후 Re-ranking에 넘길 후보 영상 수
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +123,12 @@ def hybrid_search(
     query: str,
     n_results: int,
     model_name: str = DEFAULT_MODEL,
+    use_rerank: bool = True,
 ) -> list[dict]:
     """
-    Dense + BM25 → RRF → video_id 집계 → Top-K 반환.
+    Dense + BM25 → RRF → video_id 집계 → (Re-ranking) → Top-K 반환.
     채널별로 BM25 인덱스가 없으면 Dense 전용 폴백.
+    use_rerank=False 시 집계 점수 순서 그대로 반환 (평가 비교용).
     """
     q = (query or "").strip()
     if not q:
@@ -210,4 +214,8 @@ def hybrid_search(
         scored.append((final, {**info["best"], "_score": final, "_match_count": info["match_count"], "_snippets": info["snippets"]}))
 
     scored.sort(key=lambda x: -x[0])
-    return [d for _, d in scored[:n_results]]
+    candidates = [d for _, d in scored[:RERANK_CANDIDATES]]
+
+    if use_rerank:
+        return _rerank(query, candidates, n_results)
+    return candidates[:n_results]
